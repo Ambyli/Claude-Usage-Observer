@@ -359,20 +359,23 @@ class UsagePopup:
         """Resize and reposition the window to fit its current content."""
         if not (self._win and self._win.winfo_exists()):
             return
-        self._win.update_idletasks()
-        h = self._win.winfo_reqheight()
         try:
-            import ctypes
-            class _RECT(ctypes.Structure):
-                _fields_ = [("left", ctypes.c_long), ("top", ctypes.c_long),
-                             ("right", ctypes.c_long), ("bottom", ctypes.c_long)]
-            rc = _RECT()
-            ctypes.windll.user32.SystemParametersInfoW(48, 0, ctypes.byref(rc), 0)
-            x, y = rc.right - 300 - 4, rc.bottom - h - 4
+            self._win.update_idletasks()
+            h = self._win.winfo_reqheight()
+            try:
+                import ctypes
+                class _RECT(ctypes.Structure):
+                    _fields_ = [("left", ctypes.c_long), ("top", ctypes.c_long),
+                                 ("right", ctypes.c_long), ("bottom", ctypes.c_long)]
+                rc = _RECT()
+                ctypes.windll.user32.SystemParametersInfoW(48, 0, ctypes.byref(rc), 0)
+                x, y = rc.right - 300 - 4, rc.bottom - h - 4
+            except Exception:
+                sw, sh = self._win.winfo_screenwidth(), self._win.winfo_screenheight()
+                x, y = sw - 300 - 4, sh - h - 4
+            self._win.geometry(f"300x{h}+{x}+{y}")
         except Exception:
-            sw, sh = self._win.winfo_screenwidth(), self._win.winfo_screenheight()
-            x, y = sw - 300 - 4, sh - h - 4
-        self._win.geometry(f"300x{h}+{x}+{y}")
+            pass  # WinError 1402 (invalid cursor handle) can fire during widget cleanup
 
     def _collapsible_section(self, parent, title: str, initial_open: bool = True) -> tk.Frame:
         """Add a toggle-button section header; return the content frame."""
