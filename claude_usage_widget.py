@@ -505,7 +505,7 @@ class UsagePopup:
                 tk.Label(self._proj_content, text="No data today",
                          font=("Segoe UI", 8), fg="#505060", bg=self.BG).pack(
                              anchor="w", padx=20, pady=6)
-            self._win.after(5, self._fit_window)
+            self._win.after(50, self._fit_window)
 
     # ── Countdown tick ────────────────────────────────────────────────────────
 
