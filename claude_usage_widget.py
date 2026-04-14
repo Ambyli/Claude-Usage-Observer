@@ -252,21 +252,28 @@ class UsagePopup:
     def show(self, usage: dict | None, error: str | None = None,
              next_refresh_at: datetime | None = None,
              on_refresh: callable = None):
-        """Open the popup (or bring it to front) and fill with current data."""
-        self._on_refresh    = on_refresh
+        """Open (or un-hide) the popup and fill with current data."""
+        self._on_refresh      = on_refresh
         self._next_refresh_at = next_refresh_at
 
         if self._win and self._win.winfo_exists():
-            # Already open — just update data and lift
-            self._apply(usage, error)
-            self._win.lift()
+            # Window already exists (may be hidden) — update and un-hide on the main thread
+            self._win.after(0, lambda: self._reshow(usage, error))
             return
 
+        # First open: build window and enter mainloop (blocks this thread)
         self._build_window()
         self._apply(usage, error)
         self._fit_window()
         self._tick()
         self._win.mainloop()
+
+    def _reshow(self, usage: dict | None, error: str | None):
+        """Called on the Tk main thread to un-hide and refresh the window."""
+        self._apply(usage, error)
+        self._fit_window()
+        self._win.deiconify()
+        self._win.lift()
 
     def update(self, usage: dict | None, error: str | None,
                next_refresh_at: datetime | None):
@@ -302,7 +309,7 @@ class UsagePopup:
         bar.pack(fill="x")
         tk.Label(bar, text="Claude Usage", font=("Segoe UI", 10, "bold"),
                  fg="#ffffff", bg="#13131a", anchor="w").pack(side="left", padx=12, pady=8)
-        tk.Button(bar, text="✕", command=win.destroy,
+        tk.Button(bar, text="✕", command=win.withdraw,
                   font=("Segoe UI", 9), bg="#13131a", fg="#606070",
                   relief="flat", bd=0, padx=8,
                   activebackground="#e05050", activeforeground="#ffffff").pack(side="right", pady=4, padx=4)
@@ -358,6 +365,8 @@ class UsagePopup:
     def _fit_window(self):
         """Resize and reposition the window to fit its current content."""
         if not (self._win and self._win.winfo_exists()):
+            return
+        if self._win.state() == "withdrawn":
             return
         try:
             self._win.update_idletasks()
