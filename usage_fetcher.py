@@ -50,6 +50,8 @@ class BrowserLinker:
 
     USAGE_URL = "https://claude.ai/settings/usage"
     LOGIN_TIMEOUT = 300  # seconds the user has to log in
+    CAPTURE_TIMEOUT = 30  # seconds to poll for usage data after page load
+    CAPTURE_POLL = 2  # seconds between each poll attempt
 
     _CHROME_PATHS = [
         r"C:\Program Files\Google\Chrome\Application\chrome.exe",
@@ -59,10 +61,9 @@ class BrowserLinker:
 
     # Loaded from interceptor.js at class definition time so all instances share
     # the same string without re-reading the file on every inject call.
-    _INTERCEPTOR_JS: str = (
-        open(os.path.join(os.path.dirname(__file__), "interceptor.js"), encoding="utf-8")
-        .read()
-    )
+    _INTERCEPTOR_JS: str = open(
+        os.path.join(os.path.dirname(__file__), "interceptor.js"), encoding="utf-8"
+    ).read()
 
     @property
     def _interceptor_script(self) -> str:
@@ -256,27 +257,88 @@ class BrowserLinker:
             )
             return result.get("result", {}).get("value", "") or ""
 
-        try:
-            # Inject the interceptor on whatever page is currently loaded
+        url_keywords = ("usage", "billing", "cost", "token", "organization", "metric")
+
+        def _find_usage(captured: list) -> dict | None:
+            """Return parsed usage from a captured-responses list, or None."""
+            for item in sorted(
+                captured,
+                key=lambda i: any(
+                    kw in i.get("url", "").lower() for kw in url_keywords
+                ),
+                reverse=True,
+            ):
+                body = item.get("body")
+                if isinstance(body, dict):
+                    parsed = self._parse_response(body)
+                    if parsed:
+                        return parsed
+            return None
+
+        def _navigate_and_capture(target_url: str) -> dict:
+            """Pre-register the interceptor, navigate/reload, then poll until
+            usage data appears in _capturedResponses or CAPTURE_TIMEOUT expires."""
+
+            # Register the interceptor to run before any page script on the
+            # next navigation so we never miss early API calls.
+            rpc(
+                "Page.addScriptToEvaluateOnNewDocument",
+                {"source": self._interceptor_script},
+            )
+            log.debug(
+                "BrowserLinker._cdp_fetch: interceptor pre-registered for next document"
+            )
+
+            href = eval_str("location.href")
+            if "settings/usage" not in href:
+                log.debug("BrowserLinker._cdp_fetch: navigating to usage page")
+                rpc("Page.navigate", {"url": target_url})
+            else:
+                log.debug("BrowserLinker._cdp_fetch: already on usage page, reloading")
+                rpc("Page.reload", {})
+
+            # Also inject immediately into whatever is currently loaded so any
+            # already-open page gets the interceptor without waiting for a reload.
             rpc("Runtime.evaluate", {"expression": self._interceptor_script})
 
-            href = eval_str("location.href")
+            # Poll until usage data appears or we time out.
+            deadline = time.time() + self.CAPTURE_TIMEOUT
+            attempt = 0
+            while time.time() < deadline:
+                time.sleep(self.CAPTURE_POLL)
+                attempt += 1
+                raw = eval_str("JSON.stringify(window._capturedResponses || [])")
+                captured = _json.loads(raw) if raw else []
+                log.debug(
+                    "BrowserLinker._cdp_fetch: poll #%d — %d response(s) captured",
+                    attempt,
+                    len(captured),
+                )
+                result = _find_usage(captured)
+                if result:
+                    log.debug(
+                        "BrowserLinker._cdp_fetch: usage data found on poll #%d",
+                        attempt,
+                    )
+                    return result
 
-            if "settings/usage" not in href:
-                rpc("Page.navigate", {"url": self.USAGE_URL})
-                time.sleep(5)
-                rpc("Runtime.evaluate", {"expression": self._interceptor_script})
-                time.sleep(4)
-            else:
-                # Already on the right page — reload to trigger a fresh XHR capture
-                rpc("Page.reload", {})
-                time.sleep(5)
+            raise RuntimeError(
+                f"No usage data found after {self.CAPTURE_TIMEOUT}s — the page may "
+                "have changed or no data is available for this account"
+            )
 
-            # Check whether we landed on a login page
+        # Main flow: connect to CDP, inject interceptor, navigate/reload, poll for usage data, parse and return it.
+        try:
             href = eval_str("location.href")
-            if any(
-                kw in href for kw in ("login", "signin", "/auth", "claude.ai/login")
-            ):
+            si_kws = (
+                "login",
+                "signin",
+                "/auth",
+                "claude.ai/login",
+            )  # sign in keywords to detect a login wall
+
+            # Handle login wall before attempting capture.
+            if any(kw in href for kw in si_kws):
                 self._set_status("waiting_login")
                 self._notify()
                 log.debug("BrowserLinker._cdp_fetch: waiting for user to log in")
@@ -284,46 +346,17 @@ class BrowserLinker:
                 while time.time() < deadline:
                     time.sleep(3)
                     href = eval_str("location.href")
-                    if not any(kw in href for kw in ("login", "signin", "/auth")):
-                        rpc("Page.navigate", {"url": self.USAGE_URL})
-                        time.sleep(5)
-                        rpc("Runtime.evaluate", {"expression": self._interceptor_script})
-                        time.sleep(4)
+                    if not any(kw in href for kw in si_kws):
                         break
                 else:
                     raise TimeoutError(
                         "Login timed out (5 min) — click Link Browser to retry"
                     )
 
-            # Collect everything the interceptor captured
-            raw = eval_str("JSON.stringify(window._capturedResponses || [])")
-            captured = _json.loads(raw) if raw else []
-            log.warning(
-                "BrowserLinker._cdp_fetch: captured %d responses, checking for usage data",
-                len(captured),
-            )
+            return _navigate_and_capture(self.USAGE_URL)
 
         finally:
             ws.close()
-
-        # Try URL-hinted responses first (most likely to carry usage data)
-        url_keywords = ("usage", "billing", "cost", "token", "organization", "metric")
-        for item in sorted(
-            captured,
-            key=lambda i: any(kw in i.get("url", "").lower() for kw in url_keywords),
-            reverse=True,
-        ):
-            body = item.get("body")
-            if isinstance(body, dict):
-                parsed = self._parse_response(body)
-                if parsed:
-                    log.debug("BrowserLinker._cdp_fetch: found usage data")
-                    return parsed
-
-        raise RuntimeError(
-            "No usage data found — the page may have changed or no data is "
-            "available for this account"
-        )
 
     # ── Response parser ───────────────────────────────────────────────────────
 
