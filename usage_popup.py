@@ -33,10 +33,11 @@ class UsagePopup:
     TRACK = "#2e2e38"
     GREEN = "#50d490"
 
-    def __init__(self, console_available: bool = False):
+    def __init__(self, console_available: bool = False, on_link_browser=None):
         log.debug("Starting UsagePopup.__init__ console_available=%s", console_available)
         self._win: tk.Tk | None = None
         self._on_refresh        = None
+        self._on_link_browser   = on_link_browser
         self._next_refresh_at: datetime | None = None
         self._refreshing: bool  = False
 
@@ -49,9 +50,11 @@ class UsagePopup:
         self._cs_w_bar: tk.Canvas | None = None
         # Dynamic content frame for per-project breakdown
         self._proj_content: tk.Frame | None = None
-        # Account-stats section (only built when selenium is available)
-        self._console_available = console_available
-        self._cs_content: tk.Frame | None = None
+        # Account-stats section (only built when fetcher is available)
+        self._console_available              = console_available
+        self._cs_content:    tk.Frame | None = None
+        self._cs_link_frame: tk.Frame | None = None   # shown when unlinked
+        self._cs_stats_frame: tk.Frame | None = None  # shown when linked
         log.debug("Finished UsagePopup.__init__")
 
     # ── Public API ────────────────────────────────────────────────────────────
@@ -175,34 +178,53 @@ class UsagePopup:
             self._cs_content = self._collapsible_section(
                 win, "Account stats — claude.ai", initial_open=False
             )
-            tk.Label(self._cs_content, textvariable=_sv("cs_status"),
+
+            # ── Unlinked state: prompt + button ──
+            self._cs_link_frame = tk.Frame(self._cs_content, bg=self.BG)
+            self._cs_link_frame.pack(fill="x", padx=16, pady=(8, 6))
+            tk.Label(self._cs_link_frame,
+                     text="Open claude.ai/settings/usage in Chrome\n"
+                          "and link it to see your account stats.",
+                     font=("Segoe UI", 8), fg="#808090", bg=self.BG,
+                     justify="left").pack(anchor="w")
+            tk.Button(self._cs_link_frame, text="Link Browser",
+                      command=self._on_link_click,
+                      font=("Segoe UI", 9, "bold"), bg="#2a5a8a", fg="#ffffff",
+                      relief="flat", bd=0, padx=12, pady=4,
+                      activebackground="#3a6a9a", activeforeground="#ffffff",
+                      cursor="hand2").pack(anchor="w", pady=(6, 0))
+
+            # ── Linked state: status + stats ──
+            self._cs_stats_frame = tk.Frame(self._cs_content, bg=self.BG)
+            # (packed/unpacked dynamically in _apply_console)
+            tk.Label(self._cs_stats_frame, textvariable=_sv("cs_status"),
                      font=("Segoe UI", 7), fg="#606070", bg=self.BG).pack(
                          anchor="w", padx=20, pady=(4, 0))
             # Daily
-            tk.Label(self._cs_content, textvariable=_sv("cs_d_head"),
+            tk.Label(self._cs_stats_frame, textvariable=_sv("cs_d_head"),
                      font=("Segoe UI", 8, "bold"), fg="#a0a0b0", bg=self.BG).pack(
                          anchor="w", padx=16, pady=(4, 0))
-            tk.Label(self._cs_content, textvariable=_sv("cs_d_total"),
+            tk.Label(self._cs_stats_frame, textvariable=_sv("cs_d_total"),
                      font=("Segoe UI", 13, "bold"), fg="#ffffff", bg=self.BG).pack(
                          anchor="w", padx=16, pady=(1, 0))
-            self._cs_d_bar = self._make_bar(self._cs_content)
-            tk.Label(self._cs_content, textvariable=_sv("cs_d_pct"),
+            self._cs_d_bar = self._make_bar(self._cs_stats_frame)
+            tk.Label(self._cs_stats_frame, textvariable=_sv("cs_d_pct"),
                      font=("Segoe UI", 8), fg="#808090", bg=self.BG).pack(anchor="w", padx=20)
             # Weekly
-            tk.Label(self._cs_content, textvariable=_sv("cs_w_head"),
+            tk.Label(self._cs_stats_frame, textvariable=_sv("cs_w_head"),
                      font=("Segoe UI", 8, "bold"), fg="#a0a0b0", bg=self.BG).pack(
                          anchor="w", padx=16, pady=(6, 0))
-            tk.Label(self._cs_content, textvariable=_sv("cs_w_total"),
+            tk.Label(self._cs_stats_frame, textvariable=_sv("cs_w_total"),
                      font=("Segoe UI", 13, "bold"), fg="#ffffff", bg=self.BG).pack(
                          anchor="w", padx=16, pady=(1, 0))
-            self._cs_w_bar = self._make_bar(self._cs_content)
-            tk.Label(self._cs_content, textvariable=_sv("cs_w_pct"),
+            self._cs_w_bar = self._make_bar(self._cs_stats_frame)
+            tk.Label(self._cs_stats_frame, textvariable=_sv("cs_w_pct"),
                      font=("Segoe UI", 8), fg="#808090", bg=self.BG).pack(anchor="w", padx=20)
             # Reset countdown
-            tk.Label(self._cs_content, textvariable=_sv("cs_reset"),
+            tk.Label(self._cs_stats_frame, textvariable=_sv("cs_reset"),
                      font=("Segoe UI", 8), fg="#606070", bg=self.BG).pack(
                          anchor="w", padx=20, pady=(4, 0))
-            tk.Frame(self._cs_content, height=6, bg=self.BG).pack()
+            tk.Frame(self._cs_stats_frame, height=6, bg=self.BG).pack()
 
         # ── Countdown ──
         self._divider(win)
@@ -378,7 +400,15 @@ class UsagePopup:
             self._win.after(50, self._fit_window)
         log.debug("Finished UsagePopup._apply")
 
-    # ── Account-stats update (called from UsageFetcher thread) ───────────────
+    # ── Link-browser button ───────────────────────────────────────────────────
+
+    def _on_link_click(self):
+        log.debug("Starting UsagePopup._on_link_click")
+        if self._on_link_browser:
+            threading.Thread(target=self._on_link_browser, daemon=True).start()
+        log.debug("Finished UsagePopup._on_link_click")
+
+    # ── Account-stats update (called from BrowserLinker thread) ──────────────
 
     def apply_console(self, state: dict):
         """Thread-safe: push account-stats fetch state into the UI."""
@@ -399,6 +429,20 @@ class UsagePopup:
         fetched_at = state.get("fetched_at")
         error      = state.get("error", "")
 
+        def _show_link_frame():
+            if self._cs_link_frame and not self._cs_link_frame.winfo_ismapped():
+                self._cs_link_frame.pack(fill="x", padx=16, pady=(8, 6))
+            if self._cs_stats_frame and self._cs_stats_frame.winfo_ismapped():
+                self._cs_stats_frame.pack_forget()
+            self._win.after(50, self._fit_window)
+
+        def _show_stats_frame():
+            if self._cs_link_frame and self._cs_link_frame.winfo_ismapped():
+                self._cs_link_frame.pack_forget()
+            if self._cs_stats_frame and not self._cs_stats_frame.winfo_ismapped():
+                self._cs_stats_frame.pack(fill="x")
+            self._win.after(50, self._fit_window)
+
         def _clear():
             for k in ("cs_d_head","cs_d_total","cs_d_pct","cs_w_head","cs_w_total","cs_w_pct","cs_reset"):
                 v[k].set("—")
@@ -407,16 +451,23 @@ class UsagePopup:
             if self._cs_w_bar:
                 self._draw_bar(self._cs_w_bar, 0, 0)
 
-        if status == "loading":
+        if status == "unlinked":
+            _show_link_frame()
+            return
+        elif status == "loading":
+            _show_stats_frame()
             v["cs_status"].set("Loading…")
             _clear()
         elif status == "waiting_login":
+            _show_stats_frame()
             v["cs_status"].set("Waiting for login — check Chrome window…")
             _clear()
         elif status == "error":
+            _show_stats_frame()
             short = (error[:60] + "…") if len(error) > 60 else error
             v["cs_status"].set(f"Error: {short}")
         elif status == "ok" and data:
+            _show_stats_frame()
             if fetched_at:
                 age = int((datetime.now() - fetched_at).total_seconds() / 60)
                 v["cs_status"].set("Just fetched" if age < 1 else f"Fetched {age} min ago")

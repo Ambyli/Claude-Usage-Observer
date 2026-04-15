@@ -37,14 +37,14 @@ INCLUDE_PATHS: list[str] = [p.strip().lower() for p in _raw_paths.split(",") if 
 _raw_exclude = os.environ.get("EXCLUDE_WEEKDAYS", "5,6")
 EXCLUDE_WEEKDAYS: set[int] = {int(d.strip()) for d in _raw_exclude.split(",") if d.strip()}
 
-# ── Usage fetcher (Selenium) ──────────────────────────────────────────────────
+# ── Browser linker (CDP) ──────────────────────────────────────────────────────
 
-# Set CONSOLE_FETCHER_ENABLED=true to enable; all other CONSOLE_* settings are
-# ignored when it is disabled.  Set CONSOLE_HEADLESS=false to show the browser.
+# Set CONSOLE_FETCHER_ENABLED=true to enable the "Account stats" section.
+# The user clicks "Link Browser" to open Chrome; no headless mode, no Selenium.
 CONSOLE_FETCHER_ENABLED = os.environ.get("CONSOLE_FETCHER_ENABLED", "false").lower() == "true"
 CONSOLE_REFRESH_MINUTES = int(os.environ.get("CONSOLE_REFRESH_MINUTES", "30"))
-CONSOLE_HEADLESS        = os.environ.get("CONSOLE_HEADLESS", "true").lower() != "false"
-CONSOLE_PROFILE_DIR     = os.path.join(os.path.expanduser("~"), ".claude_widget", "chrome_profile")
+BROWSER_PROFILE_DIR     = os.path.join(os.path.expanduser("~"), ".claude_widget", "chrome_profile")
+BROWSER_DEBUG_PORT      = int(os.environ.get("BROWSER_DEBUG_PORT", "9222"))
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 

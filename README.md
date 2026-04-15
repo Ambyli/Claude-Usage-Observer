@@ -9,8 +9,8 @@ A Windows system tray widget that displays your Claude Code token usage in real 
 ```bash
 pip install pystray Pillow
 
-# Optional — enables the Account stats section (console.anthropic.com scraper)
-pip install selenium
+# Optional — enables the Account stats section (claude.ai/settings/usage browser link)
+pip install requests websocket-client
 ```
 
 ## Running
@@ -31,7 +31,7 @@ The widget appears in your system tray. Click the icon to open the popup; right-
 | **This week** | Tokens used Monday through today with a progress bar against your rolling weekly average |
 | **Last execution** | Collapsible — timestamp and token breakdown of the most recent completed assistant turn |
 | **Per project — Today** | Collapsible — each project's share of today's usage as a bar and percentage |
-| **Account stats — Console** | Collapsible — account-level token totals scraped from console.anthropic.com (requires `selenium`) |
+| **Account stats — claude.ai** | Collapsible — account-level token totals read from claude.ai/settings/usage via a linked Chrome window (requires `requests` + `websocket-client`) |
 | **Countdown** | Seconds until next auto-refresh; shows "Refreshing…" during a refresh |
 
 The **Last execution** section starts collapsed; **Per project** and **Account stats** start expanded once data is available. Click any header to toggle.
@@ -161,48 +161,56 @@ Going over 100% is possible on heavy days — the bar fills completely and the p
 
 ---
 
-## Account stats — Console
+## Account stats — claude.ai
 
-When `selenium` is installed, the widget adds an **Account stats — Console** section that shows account-level token totals pulled directly from `console.anthropic.com`. This data reflects your full Anthropic account usage regardless of which machine or project generated it.
+When `requests` and `websocket-client` are installed, the widget adds an **Account stats — claude.ai** section that shows account-level token totals read directly from `claude.ai/settings/usage`. This data reflects your full Anthropic account usage regardless of which machine or project generated it.
 
 ### Setup
 
 ```bash
-pip install selenium
+pip install requests websocket-client
 ```
 
-ChromeDriver is downloaded automatically by Selenium 4.6+ — no manual installation needed.
+No ChromeDriver, no Selenium — the widget talks directly to your existing Chrome install.
 
-### First run — Google login
+### Linking your browser
 
-On the first launch after installing selenium, the widget opens a **visible Chrome window** and navigates to `console.anthropic.com`. Log in with your Google account as you normally would. Once the console dashboard loads, the window closes and all future fetches run headlessly in the background. Your session cookies are saved to `~/.claude_widget/chrome_profile/` and reused on every subsequent start.
+When you expand the Account stats section for the first time, you'll see a **Link Browser** button. Clicking it:
 
-If your session expires (typically after several weeks), the visible window will reopen automatically for you to log in again.
+1. Opens a visible Chrome window pointing to `claude.ai/settings/usage`
+2. Uses your saved session cookies — if you're already logged in, data loads immediately
+3. Prompts you to log in normally if your session has expired — the window stays open and interactive until you're done
+4. Begins polling automatically once the usage page is loaded
+
+Your session cookies are saved to `~/.claude_widget/chrome_profile/` and reused on every subsequent click of Link Browser.
 
 ### What is displayed
 
 | Row | Description |
 |---|---|
-| Period | Date range covered by the reported totals |
-| Input | Fresh (uncached) input tokens |
-| Cache + | Cache creation tokens |
-| Cache hit | Cache read tokens |
-| Output | Output tokens |
-| **Total** | Sum of all four fields |
+| Today | Tokens used today against the period total |
+| This week | Tokens used Monday through today against the period total |
+| Resets in | Countdown to the end of your current billing period |
 
 The status line shows when data was last fetched, or a descriptive error if something went wrong.
 
 ### How it works
 
-After login the widget navigates to the usage settings page. A JavaScript interceptor (injected before page load via Chrome DevTools Protocol) captures all `fetch` and `XMLHttpRequest` responses. The first response whose shape matches the Anthropic usage API format is parsed and displayed. No credentials or API keys are stored — authentication is handled entirely by Chrome's saved session cookies.
+Chrome is launched with `--remote-debugging-port` enabled, which exposes Chrome's built-in **DevTools Protocol (CDP)** on `localhost`. The widget connects to the open tab over a WebSocket and injects a small JavaScript interceptor before the page makes its API calls.
+
+The interceptor patches `window.fetch` and `XMLHttpRequest` so that every JSON response the page receives is also copied into a list (`window._capturedResponses`). Crucially:
+
+- The **real requests go out normally** — the page renders and behaves exactly as if you'd opened it yourself
+- The response body is **cloned before reading**, so the page still gets its data unmodified
+- The interceptor is **guarded against double-injection** — re-running it on an already-patched page is a no-op
+
+Once the page has loaded, the widget reads `window._capturedResponses` via CDP, sorts the entries so URL-hinted responses (containing words like `usage`, `token`, `billing`) float to the top, and parses whichever response matches the expected token-bucket shape.
+
+Because `navigator.webdriver` is not set and no ChromeDriver process is involved, the browser looks identical to a normal user session — Cloudflare and similar bot-detection layers do not trigger.
 
 ### Refresh interval
 
-Console data refreshes every **30 minutes** by default, independently of the 5-minute local file refresh. Configure with `CONSOLE_REFRESH_MINUTES` in `.env`.
-
-### Debugging
-
-Set `CONSOLE_HEADLESS=false` in `.env` to always show the Chrome window — useful for diagnosing login or scrape issues.
+Account stats refresh every **30 minutes** by default, independently of the 5-minute local file refresh. Configure with `CONSOLE_REFRESH_MINUTES` in `.env`.
 
 ---
 
@@ -233,13 +241,13 @@ INCLUDE_PATHS=C:\Users\username\projects\work
 # Default: 5,6 (Saturday and Sunday)
 EXCLUDE_WEEKDAYS=5,6
 
-# How often to re-scrape console.anthropic.com (minutes). Default: 30.
-# Has no effect if selenium is not installed.
+# How often to re-fetch account stats from claude.ai (minutes). Default: 30.
+# Has no effect if requests/websocket-client are not installed.
 CONSOLE_REFRESH_MINUTES=30
 
-# Set to false to always show the Chrome window (useful for debugging).
-# Default: true
-CONSOLE_HEADLESS=true
+# Chrome remote debugging port used by the browser link. Default: 9222.
+# Change this if another process is already using port 9222.
+BROWSER_DEBUG_PORT=9222
 ```
 
 ### Account filtering
@@ -281,6 +289,14 @@ If both accounts have been used in the same working directory, their sessions wi
 
 | File | Purpose |
 |---|---|
-| `claude_usage_widget.py` | Main widget |
+| `claude_usage_widget.py` | Entry point |
+| `config.py` | `.env` loader and all configuration constants |
+| `logging_setup.py` | Shared logger used by all modules |
+| `usage_parser.py` | JSONL scanner — `get_usage_summary()` |
+| `usage_fetcher.py` | `BrowserLinker` — CDP browser link and account stats |
+| `usage_popup.py` | `UsagePopup` — the tkinter popup window |
+| `tray_icon.py` | `make_tray_icon()` — generates the tray icon image |
+| `startup.py` | Windows registry helpers for run-at-login |
+| `widget.py` | `ClaudeUsageWidget` — orchestrates all of the above |
 | `.env` | Local configuration (not committed) |
-| `~/.claude_widget/chrome_profile/` | Persistent Chrome session data for console login (created on first run) |
+| `~/.claude_widget/chrome_profile/` | Persistent Chrome session data (created on first Link Browser click) |

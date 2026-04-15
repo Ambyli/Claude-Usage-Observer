@@ -17,7 +17,7 @@ from config import CONSOLE_FETCHER_ENABLED, REFRESH_INTERVAL_SECONDS
 from logging_setup import log
 from startup import add_to_startup, remove_from_startup, startup_registered
 from tray_icon import make_tray_icon
-from usage_fetcher import UsageFetcher
+from usage_fetcher import BrowserLinker
 from usage_parser import get_usage_summary
 from usage_popup import UsagePopup
 
@@ -30,9 +30,12 @@ class ClaudeUsageWidget:
         self._next_refresh_at: datetime | None = None
         self._stop_event              = threading.Event()
 
-        self._fetcher = (UsageFetcher() if UsageFetcher.is_available() else None) \
+        self._fetcher = (BrowserLinker() if BrowserLinker.is_available() else None) \
             if CONSOLE_FETCHER_ENABLED else None
-        self._popup   = UsagePopup(console_available=self._fetcher is not None)
+        self._popup   = UsagePopup(
+            console_available=self._fetcher is not None,
+            on_link_browser=self._link_browser,
+        )
 
         try:
             import pystray
@@ -99,11 +102,18 @@ class ClaudeUsageWidget:
             add_to_startup()
         log.debug("Finished ClaudeUsageWidget._toggle_startup")
 
+    def _link_browser(self):
+        """Called when the user clicks 'Link Browser' in the popup."""
+        log.debug("Starting ClaudeUsageWidget._link_browser")
+        if self._fetcher is not None:
+            self._fetcher.launch(on_update=self._popup.apply_console)
+        log.debug("Finished ClaudeUsageWidget._link_browser")
+
     def _quit(self, icon, item):
         log.debug("Starting ClaudeUsageWidget._quit")
         self._stop_event.set()
         if self._fetcher is not None:
-            self._fetcher._quit_driver()
+            self._fetcher.quit()
         icon.stop()
         log.debug("Finished ClaudeUsageWidget._quit")
 
@@ -139,7 +149,7 @@ class ClaudeUsageWidget:
 
     def run(self):
         log.debug("Starting ClaudeUsageWidget.run")
-        if self._fetcher is not None:
-            self._fetcher.start(on_update=self._popup.apply_console)
+        # BrowserLinker is launched on demand via the "Link Browser" button;
+        # nothing to start automatically here.
         self._icon.run(self._refresh_loop)
         log.debug("Finished ClaudeUsageWidget.run")
