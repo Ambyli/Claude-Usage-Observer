@@ -8,6 +8,9 @@ A Windows system tray widget that displays your Claude Code token usage in real 
 
 ```bash
 pip install pystray Pillow
+
+# Optional — enables the Account stats section (console.anthropic.com scraper)
+pip install selenium
 ```
 
 ## Running
@@ -28,9 +31,10 @@ The widget appears in your system tray. Click the icon to open the popup; right-
 | **This week** | Tokens used Monday through today with a progress bar against your rolling weekly average |
 | **Last execution** | Collapsible — timestamp and token breakdown of the most recent completed assistant turn |
 | **Per project — Today** | Collapsible — each project's share of today's usage as a bar and percentage |
+| **Account stats — Console** | Collapsible — account-level token totals scraped from console.anthropic.com (requires `selenium`) |
 | **Countdown** | Seconds until next auto-refresh; shows "Refreshing…" during a refresh |
 
-The **Last execution** section starts collapsed; **Per project** starts expanded. Click either header to toggle.
+The **Last execution** section starts collapsed; **Per project** and **Account stats** start expanded once data is available. Click any header to toggle.
 
 Closing the popup with ✕ hides it without destroying it. Clicking the tray icon again restores it instantly.
 
@@ -157,6 +161,51 @@ Going over 100% is possible on heavy days — the bar fills completely and the p
 
 ---
 
+## Account stats — Console
+
+When `selenium` is installed, the widget adds an **Account stats — Console** section that shows account-level token totals pulled directly from `console.anthropic.com`. This data reflects your full Anthropic account usage regardless of which machine or project generated it.
+
+### Setup
+
+```bash
+pip install selenium
+```
+
+ChromeDriver is downloaded automatically by Selenium 4.6+ — no manual installation needed.
+
+### First run — Google login
+
+On the first launch after installing selenium, the widget opens a **visible Chrome window** and navigates to `console.anthropic.com`. Log in with your Google account as you normally would. Once the console dashboard loads, the window closes and all future fetches run headlessly in the background. Your session cookies are saved to `~/.claude_widget/chrome_profile/` and reused on every subsequent start.
+
+If your session expires (typically after several weeks), the visible window will reopen automatically for you to log in again.
+
+### What is displayed
+
+| Row | Description |
+|---|---|
+| Period | Date range covered by the reported totals |
+| Input | Fresh (uncached) input tokens |
+| Cache + | Cache creation tokens |
+| Cache hit | Cache read tokens |
+| Output | Output tokens |
+| **Total** | Sum of all four fields |
+
+The status line shows when data was last fetched, or a descriptive error if something went wrong.
+
+### How it works
+
+After login the widget navigates to the usage settings page. A JavaScript interceptor (injected before page load via Chrome DevTools Protocol) captures all `fetch` and `XMLHttpRequest` responses. The first response whose shape matches the Anthropic usage API format is parsed and displayed. No credentials or API keys are stored — authentication is handled entirely by Chrome's saved session cookies.
+
+### Refresh interval
+
+Console data refreshes every **30 minutes** by default, independently of the 5-minute local file refresh. Configure with `CONSOLE_REFRESH_MINUTES` in `.env`.
+
+### Debugging
+
+Set `CONSOLE_HEADLESS=false` in `.env` to always show the Chrome window — useful for diagnosing login or scrape issues.
+
+---
+
 ## Windows startup
 
 Use **Add to Startup** in the right-click menu to register the widget to launch automatically at login. It runs via `pythonw.exe` so no console window appears. **Remove from Startup** undoes this.
@@ -183,6 +232,14 @@ INCLUDE_PATHS=C:\Users\username\projects\work
 # excluded from the rolling average baseline.
 # Default: 5,6 (Saturday and Sunday)
 EXCLUDE_WEEKDAYS=5,6
+
+# How often to re-scrape console.anthropic.com (minutes). Default: 30.
+# Has no effect if selenium is not installed.
+CONSOLE_REFRESH_MINUTES=30
+
+# Set to false to always show the Chrome window (useful for debugging).
+# Default: true
+CONSOLE_HEADLESS=true
 ```
 
 ### Account filtering
@@ -226,3 +283,4 @@ If both accounts have been used in the same working directory, their sessions wi
 |---|---|
 | `claude_usage_widget.py` | Main widget |
 | `.env` | Local configuration (not committed) |
+| `~/.claude_widget/chrome_profile/` | Persistent Chrome session data for console login (created on first run) |

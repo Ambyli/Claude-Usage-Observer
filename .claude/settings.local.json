@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -c \"import ast; ast.parse\\(open\\('claude_usage_widget.py'\\).read\\(\\)\\); print\\('Syntax OK'\\)\")",
+      "Bash(python -c \"import ast, sys; ast.parse\\(open\\('claude_usage_widget.py'\\).read\\(\\)\\); print\\('OK — no syntax errors'\\)\")"
+    ]
+  }
+}

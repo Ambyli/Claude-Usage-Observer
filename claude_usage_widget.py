@@ -48,6 +48,11 @@ INCLUDE_PATHS: list[str] = [p.strip().lower() for p in _raw_paths.split(",") if 
 _raw_exclude = os.environ.get("EXCLUDE_WEEKDAYS", "5,6")
 EXCLUDE_WEEKDAYS: set[int] = {int(d.strip()) for d in _raw_exclude.split(",") if d.strip()}
 
+# Console stats via Selenium (optional — set CONSOLE_HEADLESS=false to debug)
+CONSOLE_REFRESH_MINUTES = int(os.environ.get("CONSOLE_REFRESH_MINUTES", "30"))
+CONSOLE_HEADLESS        = os.environ.get("CONSOLE_HEADLESS", "true").lower() != "false"
+CONSOLE_PROFILE_DIR     = os.path.join(os.path.expanduser("~"), ".claude_widget", "chrome_profile")
+
 # ── Local JSONL parser ────────────────────────────────────────────────────────
 
 def _build_daily_totals(since: date) -> tuple[dict, dict | None, dict]:
@@ -233,7 +238,7 @@ class UsagePopup:
     TRACK = "#2e2e38"
     GREEN = "#50d490"
 
-    def __init__(self):
+    def __init__(self, console_available: bool = False):
         self._win: tk.Tk | None = None
         self._on_refresh = None
         self._next_refresh_at: datetime | None = None
@@ -246,6 +251,9 @@ class UsagePopup:
         self._w_bar: tk.Canvas | None = None
         # Dynamic content frame for per-project breakdown
         self._proj_content: tk.Frame | None = None
+        # Console stats section (only built when selenium is available)
+        self._console_available = console_available
+        self._cs_content: tk.Frame | None = None
 
     # ── Public API ────────────────────────────────────────────────────────────
 
@@ -353,6 +361,22 @@ class UsagePopup:
 
         # ── Per project breakdown (collapsible, starts open) ──
         self._proj_content = self._collapsible_section(win, "Per project — Today", initial_open=True)
+
+        # ── Account stats via console (collapsible, starts collapsed) ──
+        if self._console_available:
+            self._cs_content = self._collapsible_section(
+                win, "Account stats — Console", initial_open=False
+            )
+            tk.Label(self._cs_content, textvariable=_sv("cs_status"),
+                     font=("Segoe UI", 7), fg="#606070", bg=self.BG).pack(
+                         anchor="w", padx=20, pady=(4, 0))
+            self._var_row(self._cs_content, "Period",    "cs_period")
+            self._var_row(self._cs_content, "Input",     "cs_input")
+            self._var_row(self._cs_content, "Cache +",   "cs_cc")
+            self._var_row(self._cs_content, "Cache hit", "cs_cr")
+            self._var_row(self._cs_content, "Output",    "cs_output")
+            self._var_row(self._cs_content, "Total",     "cs_total", bold=True)
+            tk.Frame(self._cs_content, height=4, bg=self.BG).pack()
 
         # ── Countdown ──
         self._divider(win)
@@ -516,6 +540,65 @@ class UsagePopup:
                              anchor="w", padx=20, pady=6)
             self._win.after(50, self._fit_window)
 
+    # ── Console stats update (called from ConsoleFetcher thread) ─────────────
+
+    def apply_console(self, state: dict):
+        """Thread-safe: push console fetch state into the UI."""
+        if self._win and self._win.winfo_exists():
+            self._win.after(0, lambda: self._apply_console(state))
+
+    def _apply_console(self, state: dict):
+        """Must be called on the Tk main thread."""
+        if not self._console_available or self._cs_content is None:
+            return
+        v          = self._vars
+        status     = state.get("status", "loading")
+        data       = state.get("data")
+        fetched_at = state.get("fetched_at")
+        error      = state.get("error", "")
+
+        dash = "—"
+
+        if status == "loading":
+            v["cs_status"].set("Loading…")
+            for k in ("cs_period","cs_input","cs_cc","cs_cr","cs_output","cs_total"):
+                v[k].set(dash)
+
+        elif status == "waiting_login":
+            v["cs_status"].set("Waiting for login — check Chrome window…")
+            for k in ("cs_period","cs_input","cs_cc","cs_cr","cs_output","cs_total"):
+                v[k].set(dash)
+
+        elif status == "error":
+            short = (error[:60] + "…") if len(error) > 60 else error
+            v["cs_status"].set(f"Error: {short}")
+            # Keep existing token values visible if we have them
+
+        elif status == "ok" and data:
+            if fetched_at:
+                age = int((datetime.now() - fetched_at).total_seconds() / 60)
+                v["cs_status"].set("Just fetched" if age < 1 else f"Fetched {age} min ago")
+            else:
+                v["cs_status"].set("OK")
+
+            # Period dates
+            ps, pe = data.get("period_start"), data.get("period_end")
+            if ps and pe:
+                try:
+                    fmt = lambda s: datetime.fromisoformat(
+                        s.replace("Z", "+00:00")).strftime("%b %d")
+                    v["cs_period"].set(f"{fmt(ps)} – {fmt(pe)}")
+                except Exception:
+                    v["cs_period"].set("")
+            else:
+                v["cs_period"].set("")
+
+            v["cs_input"].set(f"{data.get('input', 0):,}")
+            v["cs_cc"].set(f"{data.get('cache_create', 0):,}")
+            v["cs_cr"].set(f"{data.get('cache_read', 0):,}")
+            v["cs_output"].set(f"{data.get('output', 0):,}")
+            v["cs_total"].set(f"{data.get('total', 0):,}")
+
     # ── Countdown tick ────────────────────────────────────────────────────────
 
     def _tick(self):
@@ -579,6 +662,312 @@ class UsagePopup:
                  font=("Segoe UI", 9, fw), fg=color, bg=self.BG,
                  anchor="e").pack(side="right")
 
+# ── Console stats fetcher (Selenium) ─────────────────────────────────────────
+
+class ConsoleFetcher:
+    """
+    Drives a persistent headless Chrome session to scrape token-usage data
+    from console.anthropic.com.  Falls back to a visible window on first run
+    so the user can complete Google OAuth — cookies are then saved in
+    CONSOLE_PROFILE_DIR and reused on every subsequent start.
+
+    Call is_available() first; if selenium is not installed this class still
+    imports safely but start() becomes a no-op.
+    """
+
+    CONSOLE_URL = "https://console.anthropic.com"
+    USAGE_URL   = "https://console.anthropic.com/settings/usage"
+    LOGIN_TIMEOUT = 300  # seconds user has to log in
+
+    # JS injected before every new document load — captures fetch + XHR responses
+    _INTERCEPTOR_JS = """
+    window._capturedResponses = window._capturedResponses || [];
+    if (!window._fetchInterceptorActive) {
+        window._fetchInterceptorActive = true;
+        const _origFetch = window.fetch.bind(window);
+        window.fetch = async function(input, init) {
+            const url = (typeof input === 'string') ? input : (input.url || '');
+            let response;
+            try { response = await _origFetch(input, init); }
+            catch(e) { throw e; }
+            const ct = response.headers.get('content-type') || '';
+            if (ct.includes('json')) {
+                try {
+                    const clone = response.clone();
+                    const json  = await clone.json();
+                    window._capturedResponses.push({url: url, body: json});
+                } catch(_) {}
+            }
+            return response;
+        };
+        const _origOpen = XMLHttpRequest.prototype.open;
+        const _origSend = XMLHttpRequest.prototype.send;
+        XMLHttpRequest.prototype.open = function(m, url, ...a) {
+            this._xurl = url; return _origOpen.call(this, m, url, ...a);
+        };
+        XMLHttpRequest.prototype.send = function(...a) {
+            this.addEventListener('load', function() {
+                try {
+                    const json = JSON.parse(this.responseText);
+                    window._capturedResponses.push({url: this._xurl || '', body: json});
+                } catch(_) {}
+            });
+            return _origSend.call(this, ...a);
+        };
+    }
+    """
+
+    def __init__(self):
+        self._driver         = None
+        self._data: dict | None = None
+        self._error: str | None = None
+        self._status         = "loading"   # loading | waiting_login | ok | error
+        self._fetched_at: datetime | None = None
+        self._lock           = threading.Lock()
+        self._on_update      = None        # callable(state_dict)
+
+    # ── Public ────────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def is_available() -> bool:
+        """True if selenium is installed (chromedriver need not be pre-installed;
+        Selenium 4.6+ will auto-download it via selenium-manager)."""
+        try:
+            import selenium  # noqa: F401
+            return True
+        except ImportError:
+            return False
+
+    def start(self, on_update):
+        """Start the background fetch loop.  on_update(state_dict) is called
+        from the worker thread whenever data or status changes."""
+        self._on_update = on_update
+        threading.Thread(target=self._loop, daemon=True).start()
+
+    def fetch_now(self):
+        """Trigger an immediate re-fetch without waiting for the interval."""
+        threading.Thread(target=self._fetch, daemon=True).start()
+
+    def get_state(self) -> dict:
+        with self._lock:
+            return {
+                "status":     self._status,
+                "data":       self._data,
+                "error":      self._error,
+                "fetched_at": self._fetched_at,
+            }
+
+    # ── Background loop ───────────────────────────────────────────────────────
+
+    def _loop(self):
+        while True:
+            self._fetch()
+            time.sleep(CONSOLE_REFRESH_MINUTES * 60)
+
+    def _fetch(self):
+        try:
+            self._set_status("loading")
+            self._notify()
+
+            driver = self._get_driver(headless=CONSOLE_HEADLESS)
+
+            # ── Check login state ──
+            driver.get(self.CONSOLE_URL)
+            time.sleep(2)
+
+            if self._needs_login(driver):
+                if CONSOLE_HEADLESS:
+                    # Must go visible for Google OAuth (headless is blocked by Google)
+                    self._quit_driver()
+                    driver = self._get_driver(headless=False)
+                    driver.get(self.CONSOLE_URL)
+
+                self._set_status("waiting_login")
+                self._notify()
+
+                if not self._wait_for_login(driver):
+                    raise TimeoutError("Login timed out — reopen the widget to retry")
+
+                if CONSOLE_HEADLESS:
+                    # Profile now has valid cookies; restart headless
+                    self._quit_driver()
+                    driver = self._get_driver(headless=True)
+
+            # ── Navigate to usage page and capture XHR ──
+            data = self._capture_usage(driver)
+            if data is None:
+                raise RuntimeError(
+                    "Could not extract usage data — the console page layout "
+                    "may have changed, or no data is available for this account"
+                )
+
+            with self._lock:
+                self._data       = data
+                self._error      = None
+                self._status     = "ok"
+                self._fetched_at = datetime.now()
+
+        except Exception as exc:
+            with self._lock:
+                self._error  = str(exc)
+                self._status = "error"
+        finally:
+            self._notify()
+
+    # ── Driver management ─────────────────────────────────────────────────────
+
+    def _get_driver(self, headless: bool = True):
+        """Return the live driver or create a fresh one."""
+        if self._driver is not None:
+            try:
+                _ = self._driver.title   # raises if dead
+                return self._driver
+            except Exception:
+                self._driver = None
+
+        from selenium import webdriver
+        from selenium.webdriver.chrome.options import Options
+
+        os.makedirs(CONSOLE_PROFILE_DIR, exist_ok=True)
+        opts = Options()
+        opts.add_argument(f"--user-data-dir={CONSOLE_PROFILE_DIR}")
+        opts.add_argument("--no-sandbox")
+        opts.add_argument("--disable-dev-shm-usage")
+        opts.add_argument("--disable-gpu")
+        opts.add_argument("--log-level=3")
+        opts.set_capability("goog:loggingPrefs", {"performance": "ALL", "browser": "ALL"})
+        if headless:
+            opts.add_argument("--headless=new")
+
+        self._driver = webdriver.Chrome(options=opts)
+        self._driver.execute_cdp_cmd(
+            "Page.addScriptToEvaluateOnNewDocument",
+            {"source": self._INTERCEPTOR_JS},
+        )
+        return self._driver
+
+    def _quit_driver(self):
+        if self._driver is not None:
+            try:
+                self._driver.quit()
+            except Exception:
+                pass
+            self._driver = None
+
+    # ── Login helpers ─────────────────────────────────────────────────────────
+
+    def _needs_login(self, driver) -> bool:
+        url = driver.current_url.lower()
+        return any(kw in url for kw in ("login", "signin", "accounts.google", "/auth"))
+
+    def _wait_for_login(self, driver) -> bool:
+        """Block until the user finishes OAuth or LOGIN_TIMEOUT elapses."""
+        deadline = time.time() + self.LOGIN_TIMEOUT
+        while time.time() < deadline:
+            if not self._needs_login(driver):
+                time.sleep(2)   # let the post-login redirect settle
+                return True
+            time.sleep(2)
+        return False
+
+    # ── Usage capture ─────────────────────────────────────────────────────────
+
+    def _capture_usage(self, driver) -> dict | None:
+        """Navigate to the usage page and retrieve intercepted XHR responses."""
+        from selenium.webdriver.support.ui import WebDriverWait
+
+        driver.get(self.USAGE_URL)
+        WebDriverWait(driver, 15).until(
+            lambda d: d.execute_script("return document.readyState") == "complete"
+        )
+        time.sleep(4)   # let XHR calls finish after DOM ready
+
+        captured = driver.execute_script("return window._capturedResponses || []") or []
+
+        # Try URL-hinted responses first (more likely to be usage data)
+        url_keywords = ("usage", "billing", "cost", "token", "organization", "metric")
+        for item in sorted(captured,
+                           key=lambda i: any(kw in i.get("url","").lower() for kw in url_keywords),
+                           reverse=True):
+            body = item.get("body")
+            if not isinstance(body, dict):
+                continue
+            parsed = self._parse_response(body)
+            if parsed:
+                return parsed
+
+        return None
+
+    # ── Response parser ───────────────────────────────────────────────────────
+
+    def _parse_response(self, body: dict) -> dict | None:
+        """Normalise a captured API response into our display format.
+        Handles the documented Admin API shape as well as reasonable variants."""
+        if not isinstance(body, dict):
+            return None
+
+        # ── Format A: {results|data|buckets: [{token fields, ...}]} ──
+        for key in ("results", "data", "buckets", "items"):
+            results = body.get(key)
+            if results and isinstance(results, list):
+                totals = {"input": 0, "cache_create": 0, "cache_read": 0, "output": 0}
+                period_start = period_end = None
+                found = False
+
+                for bucket in results:
+                    if not isinstance(bucket, dict):
+                        continue
+                    inp = (bucket.get("uncached_input_tokens")
+                           or bucket.get("input_tokens") or 0)
+                    cc  = bucket.get("cache_creation_input_tokens") or 0
+                    cr  = bucket.get("cache_read_input_tokens") or 0
+                    out = bucket.get("output_tokens") or 0
+                    if inp + cc + cr + out > 0:
+                        found = True
+                    totals["input"]        += inp
+                    totals["cache_create"] += cc
+                    totals["cache_read"]   += cr
+                    totals["output"]       += out
+                    for sk in ("start_time", "period_start", "from", "start"):
+                        s = bucket.get(sk)
+                        if s and (period_start is None or s < period_start):
+                            period_start = s
+                    for ek in ("end_time", "period_end", "to", "end"):
+                        e = bucket.get(ek)
+                        if e and (period_end is None or e > period_end):
+                            period_end = e
+
+                if found:
+                    return {**totals,
+                            "total":        sum(totals.values()),
+                            "period_start": period_start,
+                            "period_end":   period_end}
+
+        # ── Format B: token fields directly on the object ──
+        inp = body.get("input_tokens") or body.get("uncached_input_tokens") or 0
+        out = body.get("output_tokens") or 0
+        if inp + out > 0:
+            cc = body.get("cache_creation_input_tokens") or 0
+            cr = body.get("cache_read_input_tokens") or 0
+            return {"input": inp, "cache_create": cc, "cache_read": cr, "output": out,
+                    "total": inp + cc + cr + out,
+                    "period_start": None, "period_end": None}
+
+        return None
+
+    # ── Helpers ───────────────────────────────────────────────────────────────
+
+    def _set_status(self, status: str):
+        with self._lock:
+            self._status = status
+
+    def _notify(self):
+        if self._on_update:
+            try:
+                self._on_update(self.get_state())
+            except Exception:
+                pass
+
 # ── Windows startup helpers ───────────────────────────────────────────────────
 
 _STARTUP_REG_KEY  = r"Software\Microsoft\Windows\CurrentVersion\Run"
@@ -626,7 +1015,9 @@ class ClaudeUsageWidget:
         self._usage: dict | None = None
         self._error: str | None = None
         self._next_refresh_at: datetime | None = None
-        self._popup = UsagePopup()
+
+        self._console = ConsoleFetcher() if ConsoleFetcher.is_available() else None
+        self._popup   = UsagePopup(console_available=self._console is not None)
 
         # Import here so the script still imports even if pystray isn't installed yet
         try:
@@ -710,6 +1101,8 @@ class ClaudeUsageWidget:
             time.sleep(REFRESH_INTERVAL_SECONDS)
 
     def run(self):
+        if self._console is not None:
+            self._console.start(on_update=self._popup.apply_console)
         self._icon.run(self._refresh_loop)
 
 
