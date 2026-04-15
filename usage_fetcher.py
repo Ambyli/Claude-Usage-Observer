@@ -27,7 +27,6 @@ from datetime import date, datetime, timedelta
 from config import (
     BROWSER_DEBUG_PORT,
     BROWSER_PROFILE_DIR,
-    CONSOLE_REFRESH_MINUTES,
     DEBUG_LOGGING,
 )
 from logging_setup import log
@@ -80,6 +79,8 @@ class BrowserLinker:
         self._fetched_at: datetime | None = None
         self._lock = threading.Lock()
         self._on_update = None
+        self._ws = None  # persistent CDP WebSocket
+        self._reload_requested = threading.Event()
         log.debug("Finished BrowserLinker.__init__")
 
     # ── Public ────────────────────────────────────────────────────────────────
@@ -141,9 +142,9 @@ class BrowserLinker:
         log.debug("Finished BrowserLinker.launch")
 
     def fetch_now(self):
-        """Trigger an immediate re-fetch without waiting for the interval."""
+        """Signal the live CDP session to reload the page."""
         log.debug("Starting BrowserLinker.fetch_now")
-        threading.Thread(target=self._fetch, daemon=True).start()
+        self._reload_requested.set()
         log.debug("Finished BrowserLinker.fetch_now")
 
     def quit(self):
@@ -175,39 +176,27 @@ class BrowserLinker:
         log.debug("Starting BrowserLinker._loop")
         time.sleep(4)  # give Chrome time to open the tab
         while True:
-            self._fetch()
-            time.sleep(CONSOLE_REFRESH_MINUTES * 60)
-
-    def _fetch(self):
-        log.debug("Starting BrowserLinker._fetch")
-        try:
             self._set_status("loading")
             self._notify()
-
-            data = self._cdp_fetch()
-
-            with self._lock:
-                self._data = data
-                self._error = None
-                self._status = "ok"
-                self._fetched_at = datetime.now()
-
-        except Exception as exc:
-            log.error("Error in BrowserLinker._fetch: %s", exc)
-            with self._lock:
-                self._error = str(exc)
-                self._status = "error"
-        finally:
-            log.debug("Entering finally block in BrowserLinker._fetch")
-            self._notify()
-        log.debug("Finished BrowserLinker._fetch")
+            try:
+                self._cdp_session()  # blocks until the WebSocket dies
+            except Exception as exc:
+                log.error("Error in BrowserLinker._loop: %s", exc)
+                with self._lock:
+                    self._error = str(exc)
+                    self._status = "error"
+                self._notify()
+            log.debug("BrowserLinker._loop: session ended, reconnecting in 15s")
+            time.sleep(15)
 
     # ── CDP communication ─────────────────────────────────────────────────────
 
-    def _cdp_fetch(self) -> dict:
-        """Connect to the open Chrome tab via CDP and return parsed usage data."""
+    def _cdp_session(self):
+        """Persistent CDP session: initial capture then live binding-event loop.
+        Blocks until the WebSocket connection dies, then returns so _loop can
+        reconnect."""
+        import websocket as _ws_mod
         import requests as _req
-        import websocket as _ws
 
         # Wait up to ~30 s for Chrome's debugging endpoint to respond
         tabs = None
@@ -235,20 +224,31 @@ class BrowserLinker:
         if tab is None:
             raise RuntimeError("No claude.ai tab found — keep the Chrome window open")
 
-        ws = _ws.create_connection(tab["webSocketDebuggerUrl"], timeout=15)
+        ws = _ws_mod.create_connection(tab["webSocketDebuggerUrl"], timeout=15)
+        self._ws = ws
         _id = [0]
 
-        def rpc(method, params=None):
+        def rpc(method, params=None, _timeout=10):
             _id[0] += 1
             my_id = _id[0]
             ws.send(
                 _json.dumps({"id": my_id, "method": method, "params": params or {}})
             )
-            # Drain CDP events until we get the response matching our request id
-            for _ in range(100):
-                msg = _json.loads(ws.recv())
-                if msg.get("id") == my_id:
-                    return msg.get("result", {})
+            # Drain CDP messages until we get the response matching our request id.
+            # Use a time-based deadline so a flood of Page/Runtime events never
+            # causes us to miss our own response (unlike a fixed 100-message cap).
+            ws.settimeout(1)
+            deadline = time.time() + _timeout
+            try:
+                while time.time() < deadline:
+                    try:
+                        msg = _json.loads(ws.recv())
+                    except _ws_mod.WebSocketTimeoutException:
+                        continue
+                    if msg.get("id") == my_id:
+                        return msg.get("result", {})
+            finally:
+                ws.settimeout(None)  # restore blocking mode; live loop sets its own timeout
             return {}
 
         def eval_str(expr: str) -> str:
@@ -286,15 +286,15 @@ class BrowserLinker:
                 {"source": self._interceptor_script},
             )
             log.debug(
-                "BrowserLinker._cdp_fetch: interceptor pre-registered for next document"
+                "BrowserLinker._cdp_session: interceptor pre-registered for next document"
             )
 
             href = eval_str("location.href")
             if "settings/usage" not in href:
-                log.debug("BrowserLinker._cdp_fetch: navigating to usage page")
+                log.debug("BrowserLinker._cdp_session: navigating to usage page")
                 rpc("Page.navigate", {"url": target_url})
             else:
-                log.debug("BrowserLinker._cdp_fetch: already on usage page, reloading")
+                log.debug("BrowserLinker._cdp_session: already on usage page, reloading")
                 rpc("Page.reload", {})
 
             # Also inject immediately into whatever is currently loaded so any
@@ -310,14 +310,14 @@ class BrowserLinker:
                 raw = eval_str("JSON.stringify(window._capturedResponses || [])")
                 captured = _json.loads(raw) if raw else []
                 log.debug(
-                    "BrowserLinker._cdp_fetch: poll #%d — %d response(s) captured",
+                    "BrowserLinker._cdp_session: poll #%d — %d response(s) captured",
                     attempt,
                     len(captured),
                 )
                 result = _find_usage(captured)
                 if result:
                     log.debug(
-                        "BrowserLinker._cdp_fetch: usage data found on poll #%d",
+                        "BrowserLinker._cdp_session: usage data found on poll #%d",
                         attempt,
                     )
                     return result
@@ -327,21 +327,14 @@ class BrowserLinker:
                 "have changed or no data is available for this account"
             )
 
-        # Main flow: connect to CDP, inject interceptor, navigate/reload, poll for usage data, parse and return it.
         try:
-            href = eval_str("location.href")
-            si_kws = (
-                "login",
-                "signin",
-                "/auth",
-                "claude.ai/login",
-            )  # sign in keywords to detect a login wall
+            si_kws = ("login", "signin", "/auth", "claude.ai/login")
 
-            # Handle login wall before attempting capture.
+            href = eval_str("location.href")
             if any(kw in href for kw in si_kws):
                 self._set_status("waiting_login")
                 self._notify()
-                log.debug("BrowserLinker._cdp_fetch: waiting for user to log in")
+                log.debug("BrowserLinker._cdp_session: waiting for user to log in")
                 deadline = time.time() + self.LOGIN_TIMEOUT
                 while time.time() < deadline:
                     time.sleep(3)
@@ -353,10 +346,103 @@ class BrowserLinker:
                         "Login timed out (5 min) — click Link Browser to retry"
                     )
 
-            return _navigate_and_capture(self.USAGE_URL)
+            # Enable the Page domain so addScriptToEvaluateOnNewDocument is
+            # honoured by Chrome and Page.loadEventFired fires in the live loop.
+            rpc("Page.enable")
+
+            # Register the binding BEFORE navigating so window.__cdpNotify
+            # exists when the interceptor runs on the first page load.
+            # Runtime.bindingCalled events that arrive during the rpc() drain
+            # loop inside _navigate_and_capture are silently discarded (rpc
+            # only returns on a matching id), so this doesn't break polling.
+            # Runtime.enable is intentionally NOT called — it floods the
+            # WebSocket with execution-context events that break rpc().
+            rpc("Runtime.addBinding", {"name": "__cdpNotify"})
+
+            # Initial navigate + polling capture.
+            data = _navigate_and_capture(self.USAGE_URL)
+
+            with self._lock:
+                self._data = data
+                self._error = None
+                self._status = "ok"
+                self._fetched_at = datetime.now()
+            self._notify()
+
+            # ── Persistent live-update loop ───────────────────────────────────
+            # The interceptor calls window.__cdpNotify() on every captured
+            # response, which Chrome delivers as a Runtime.bindingCalled event.
+            # We also watch for fetch_now() reload requests and Page.loadEventFired
+            # so we can re-inject the interceptor after a full navigation.
+            log.debug("BrowserLinker._cdp_session: entering live-event loop")
+
+            def _send(method, params=None):
+                """Fire-and-forget CDP command — no response waiting, safe inside the event loop."""
+                _id[0] += 1
+                ws.send(_json.dumps({"id": _id[0], "method": method, "params": params or {}}))
+
+            ws.settimeout(5)
+            while True:
+                # Check if a reload was requested via fetch_now()
+                if self._reload_requested.is_set():
+                    self._reload_requested.clear()
+                    log.debug("BrowserLinker._cdp_session: reload requested — navigating")
+                    # Pre-register the interceptor for the next document, then navigate.
+                    # Both are fire-and-forget so the recv() timeout never applies here.
+                    _send("Page.addScriptToEvaluateOnNewDocument",
+                          {"source": self._interceptor_script})
+                    _send("Page.navigate", {"url": self.USAGE_URL})
+
+                try:
+                    msg = _json.loads(ws.recv())
+                except _ws_mod.WebSocketTimeoutException:
+                    # Keep-alive: connection is idle but still open.
+                    continue
+
+                method = msg.get("method", "")
+
+                # Re-register the binding and re-inject the interceptor after
+                # each full page load.  Runtime.addBinding may not survive a
+                # navigation (new execution context destroys the old binding),
+                # and addScriptToEvaluateOnNewDocument already handles early
+                # API calls; this eval is a belt-and-suspenders fallback.
+                if method == "Page.loadEventFired":
+                    log.debug(
+                        "BrowserLinker._cdp_session: page loaded — re-registering binding and interceptor"
+                    )
+                    _send("Runtime.addBinding", {"name": "__cdpNotify"})
+                    _send("Runtime.evaluate", {"expression": self._interceptor_script})
+                    continue
+
+                if (
+                    method == "Runtime.bindingCalled"
+                    and msg.get("params", {}).get("name") == "__cdpNotify"
+                ):
+                    try:
+                        payload = _json.loads(msg["params"].get("payload", "{}"))
+                        parsed = self._parse_response(payload.get("body", {}))
+                        if parsed:
+                            log.debug(
+                                "BrowserLinker._cdp_session: live update received"
+                            )
+                            with self._lock:
+                                self._data = parsed
+                                self._error = None
+                                self._status = "ok"
+                                self._fetched_at = datetime.now()
+                            self._notify()
+                    except Exception as exc:
+                        log.warning(
+                            "BrowserLinker._cdp_session: error processing binding event: %s",
+                            exc,
+                        )
 
         finally:
-            ws.close()
+            self._ws = None
+            try:
+                ws.close()
+            except Exception:
+                pass
 
     # ── Response parser ───────────────────────────────────────────────────────
 
