@@ -131,6 +131,8 @@ class ClaudeUsageWidget:
         log.debug("Starting ClaudeUsageWidget._do_refresh")
         self._icon.icon  = make_tray_icon("loading")
         self._icon.title = "Claude Usage — refreshing..."
+        if self._fetcher is not None:
+            self._fetcher.fetch_now()
         try:
             self._usage  = get_usage_summary()
             self._error  = None
