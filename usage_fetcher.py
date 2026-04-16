@@ -248,7 +248,9 @@ class BrowserLinker:
                     if msg.get("id") == my_id:
                         return msg.get("result", {})
             finally:
-                ws.settimeout(None)  # restore blocking mode; live loop sets its own timeout
+                ws.settimeout(
+                    None
+                )  # restore blocking mode; live loop sets its own timeout
             return {}
 
         def eval_str(expr: str) -> str:
@@ -294,7 +296,9 @@ class BrowserLinker:
                 log.debug("BrowserLinker._cdp_session: navigating to usage page")
                 rpc("Page.navigate", {"url": target_url})
             else:
-                log.debug("BrowserLinker._cdp_session: already on usage page, reloading")
+                log.debug(
+                    "BrowserLinker._cdp_session: already on usage page, reloading"
+                )
                 rpc("Page.reload", {})
 
             # Also inject immediately into whatever is currently loaded so any
@@ -350,13 +354,18 @@ class BrowserLinker:
             # honoured by Chrome and Page.loadEventFired fires in the live loop.
             rpc("Page.enable")
 
+            # Runtime.enable is required for Runtime.addBinding to actually
+            # expose the function on window.__cdpNotify.  Without it the binding
+            # is registered in Chrome but never injected into the page's JS
+            # context, so the typeof check in interceptor.js always fails.
+            # Runtime.enable also causes Chrome to flood the socket with
+            # executionContext* events; the live loop already tolerates unknown
+            # messages so this is safe — only the rpc() drain loop is affected,
+            # and that runs before the live loop starts.
+            rpc("Runtime.enable")
+
             # Register the binding BEFORE navigating so window.__cdpNotify
             # exists when the interceptor runs on the first page load.
-            # Runtime.bindingCalled events that arrive during the rpc() drain
-            # loop inside _navigate_and_capture are silently discarded (rpc
-            # only returns on a matching id), so this doesn't break polling.
-            # Runtime.enable is intentionally NOT called — it floods the
-            # WebSocket with execution-context events that break rpc().
             rpc("Runtime.addBinding", {"name": "__cdpNotify"})
 
             # Initial navigate + polling capture.
@@ -370,46 +379,91 @@ class BrowserLinker:
             self._notify()
 
             # ── Persistent live-update loop ───────────────────────────────────
-            # The interceptor calls window.__cdpNotify() on every captured
-            # response, which Chrome delivers as a Runtime.bindingCalled event.
-            # We also watch for fetch_now() reload requests and Page.loadEventFired
-            # so we can re-inject the interceptor after a full navigation.
+            # Two complementary paths deliver live updates:
+            #   1. Runtime.bindingCalled — fast path when window.__cdpNotify is
+            #      available (Chrome doesn't guarantee the binding is injected
+            #      before addScriptToEvaluateOnNewDocument scripts run, so this
+            #      may silently miss early-load API calls).
+            #   2. _capturedResponses polling — reliable fallback; on every
+            #      5-second keep-alive tick we read the full array and process
+            #      any items beyond the last index we already handled.
             log.debug("BrowserLinker._cdp_session: entering live-event loop")
 
             def _send(method, params=None):
                 """Fire-and-forget CDP command — no response waiting, safe inside the event loop."""
                 _id[0] += 1
-                ws.send(_json.dumps({"id": _id[0], "method": method, "params": params or {}}))
+                ws.send(
+                    _json.dumps(
+                        {"id": _id[0], "method": method, "params": params or {}}
+                    )
+                )
+
+            def _poll_captured():
+                """Read window._capturedResponses via eval and process any new items."""
+                nonlocal _last_captured_idx
+                try:
+                    raw = eval_str("JSON.stringify(window._capturedResponses || [])")
+                    captured = _json.loads(raw) if raw else []
+                except Exception:
+                    return
+                for item in captured[_last_captured_idx:]:
+                    parsed = self._parse_response(item.get("body", {}))
+                    if parsed:
+                        log.debug(
+                            "BrowserLinker._cdp_session: live update via poll (idx=%d)",
+                            _last_captured_idx,
+                        )
+                        with self._lock:
+                            self._data = parsed
+                            self._error = None
+                            self._status = "ok"
+                            self._fetched_at = datetime.now()
+                        self._notify()
+                _last_captured_idx = len(captured)
+
+            # Start polling index just past what _navigate_and_capture already read.
+            _last_captured_idx = 0
+            try:
+                raw = eval_str("JSON.stringify(window._capturedResponses || [])")
+                _last_captured_idx = len(_json.loads(raw)) if raw else 0
+            except Exception:
+                pass
 
             ws.settimeout(5)
             while True:
-                # Check if a reload was requested via fetch_now()
+                # Check if a reload was requested
                 if self._reload_requested.is_set():
                     self._reload_requested.clear()
-                    log.debug("BrowserLinker._cdp_session: reload requested — navigating")
+                    _last_captured_idx = 0  # new document — reset poll index
+                    log.debug(
+                        "BrowserLinker._cdp_session: reload requested — navigating"
+                    )
                     # Pre-register the interceptor for the next document, then navigate.
                     # Both are fire-and-forget so the recv() timeout never applies here.
-                    _send("Page.addScriptToEvaluateOnNewDocument",
-                          {"source": self._interceptor_script})
+                    _send(
+                        "Page.addScriptToEvaluateOnNewDocument",
+                        {"source": self._interceptor_script},
+                    )
                     _send("Page.navigate", {"url": self.USAGE_URL})
 
                 try:
                     msg = _json.loads(ws.recv())
                 except _ws_mod.WebSocketTimeoutException:
-                    # Keep-alive: connection is idle but still open.
+                    # Keep-alive tick — poll _capturedResponses for anything the
+                    # binding may have missed (e.g. early-load API calls).
+                    _poll_captured()
                     continue
 
                 method = msg.get("method", "")
 
                 # Re-register the binding and re-inject the interceptor after
-                # each full page load.  Runtime.addBinding may not survive a
-                # navigation (new execution context destroys the old binding),
-                # and addScriptToEvaluateOnNewDocument already handles early
-                # API calls; this eval is a belt-and-suspenders fallback.
+                # each full page load.  Reset the poll index so we re-scan from
+                # the start of the fresh document's captures.
                 if method == "Page.loadEventFired":
                     log.debug(
                         "BrowserLinker._cdp_session: page loaded — re-registering binding and interceptor"
                     )
+                    _last_captured_idx = 0
                     _send("Runtime.addBinding", {"name": "__cdpNotify"})
                     _send("Runtime.evaluate", {"expression": self._interceptor_script})
                     continue
@@ -423,7 +477,7 @@ class BrowserLinker:
                         parsed = self._parse_response(payload.get("body", {}))
                         if parsed:
                             log.debug(
-                                "BrowserLinker._cdp_session: live update received"
+                                "BrowserLinker._cdp_session: live update via binding"
                             )
                             with self._lock:
                                 self._data = parsed
@@ -431,6 +485,17 @@ class BrowserLinker:
                                 self._status = "ok"
                                 self._fetched_at = datetime.now()
                             self._notify()
+                            # Advance poll index to match so the next tick
+                            # doesn't re-process the same item.
+                            try:
+                                raw = eval_str(
+                                    "JSON.stringify(window._capturedResponses || [])"
+                                )
+                                _last_captured_idx = (
+                                    len(_json.loads(raw)) if raw else _last_captured_idx
+                                )
+                            except Exception:
+                                pass
                     except Exception as exc:
                         log.warning(
                             "BrowserLinker._cdp_session: error processing binding event: %s",
@@ -451,6 +516,7 @@ class BrowserLinker:
         Handles the documented Admin API shape as well as reasonable variants.
         Also computes daily_total and weekly_total from bucketed timestamps."""
         log.debug("Starting BrowserLinker._parse_response")
+        log.debug("_parse_response body keys: %s | sample: %.300s", list(body.keys()) if isinstance(body, dict) else type(body), str(body))
         if not isinstance(body, dict):
             return None
 
@@ -549,6 +615,40 @@ class BrowserLinker:
                 "period_start": None,
                 "period_end": None,
             }
+
+        # ── Format C: utilization-based response (five_hour / seven_day) ──
+        # e.g. {"five_hour": {"utilization": 30.0, "resets_at": "..."}, "seven_day": {...}}
+        five_hour = body.get("five_hour")
+        seven_day = body.get("seven_day")
+        if isinstance(five_hour, dict) or isinstance(seven_day, dict):
+            def _util_block(block) -> dict | None:
+                if not isinstance(block, dict):
+                    return None
+                util = block.get("utilization")
+                if util is None:
+                    return None
+                return {
+                    "utilization": float(util),
+                    "resets_at": block.get("resets_at"),
+                }
+
+            fh = _util_block(five_hour)
+            sd = _util_block(seven_day)
+            if fh is not None or sd is not None:
+                extra = body.get("extra_usage")
+                log.debug("Finished BrowserLinker._parse_response (Format C)")
+                return {
+                    "format": "utilization",
+                    "five_hour": fh,
+                    "seven_day": sd,
+                    "extra_usage": extra if isinstance(extra, dict) else None,
+                    # Legacy fields so any code that reads them doesn't crash.
+                    "daily_total": 0,
+                    "weekly_total": 0,
+                    "total": 0,
+                    "period_start": None,
+                    "period_end": (sd or fh or {}).get("resets_at"),
+                }
 
         log.debug("Finished BrowserLinker._parse_response: None")
         return None

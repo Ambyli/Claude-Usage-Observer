@@ -54,13 +54,12 @@ if (!window._fetchInterceptorActive) {
         const clone = response.clone();
         const json = await clone.json();
         window._capturedResponses.push({ url: url, body: json });
-        _log("[interceptor] fetch captured:", url, json);
+        _log("[interceptor] fetch captured & notified:", url, json);
         // Notify the CDP fetcher if it's listening.  The fetcher may have navigated away and lost the original binding, so this is a best-effort attempt to keep it updated with new captures after a navigation.
-        if (typeof window.__cdpNotify === "function") {
-          _log("[interceptor] fetch notifying:", url, json);
-          try {
-            window.__cdpNotify(JSON.stringify({ url: url, body: json }));
-          } catch (_) {}
+        try {
+          window.__cdpNotify(JSON.stringify({ url: url, body: json }));
+        } catch (_) {
+          _log("[interceptor] fetch: failed to notify CDP fetcher for", url);
         }
       } catch (_) {
         _log("[interceptor] fetch: failed to parse JSON body for", url);
@@ -102,15 +101,17 @@ if (!window._fetchInterceptorActive) {
       try {
         const json = JSON.parse(this.responseText);
         window._capturedResponses.push({ url: this._xurl || "", body: json });
-        _log("[interceptor] XHR captured:", this._xurl || "", json);
+        _log("[interceptor] XHR captured & notified:", this._xurl || "", json);
         // Notify the CDP fetcher if it's listening.  The fetcher may have navigated away and lost the original binding, so this is a best-effort attempt to keep it updated with new captures after a navigation.
-        if (typeof window.__cdpNotify === "function") {
-          _log("[interceptor] XHR notifying:", this._xurl || "", json);
-          try {
-            window.__cdpNotify(
-              JSON.stringify({ url: this._xurl || "", body: json }),
-            );
-          } catch (_) {}
+        try {
+          window.__cdpNotify(
+            JSON.stringify({ url: this._xurl || "", body: json }),
+          );
+        } catch (_) {
+          _log(
+            "[interceptor] XHR: failed to notify CDP fetcher for",
+            this._xurl || "",
+          );
         }
       } catch (_) {
         _log(

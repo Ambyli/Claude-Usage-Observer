@@ -605,7 +605,12 @@ class UsagePopup:
         fetched_at = state.get("fetched_at")
         error = state.get("error", "")
 
+        # ── Frame switchers ──
+        # Swaps between the "Link Browser" prompt and the live stats view
+        # depending on whether a browser session is currently linked.
+
         def _show_link_frame():
+            # Shows: "Open claude.ai/settings/usage in Chrome and link it…" + [Link Browser] button
             if self._cs_link_frame and not self._cs_link_frame.winfo_ismapped():
                 self._cs_link_frame.pack(fill="x", padx=16, pady=(8, 6))
             if self._cs_stats_frame and self._cs_stats_frame.winfo_ismapped():
@@ -613,6 +618,7 @@ class UsagePopup:
             self._win.after(50, self._fit_window)
 
         def _show_stats_frame():
+            # Shows: status line, daily section, weekly section, reset countdown
             if self._cs_link_frame and self._cs_link_frame.winfo_ismapped():
                 self._cs_link_frame.pack_forget()
             if self._cs_stats_frame and not self._cs_stats_frame.winfo_ismapped():
@@ -620,6 +626,7 @@ class UsagePopup:
             self._win.after(50, self._fit_window)
 
         def _clear():
+            # Resets all stat labels to "—" and empties both progress bars
             for k in (
                 "cs_d_head",
                 "cs_d_total",
@@ -635,22 +642,35 @@ class UsagePopup:
             if self._cs_w_bar:
                 self._draw_bar(self._cs_w_bar, 0, 0)
 
+        # ── Status routing ──
+        # Each branch controls which frame is visible and what the status
+        # line (small grey text at the top of the stats frame) shows.
+
         if status == "unlinked":
+            # No browser linked yet — show the "Link Browser" prompt
             _show_link_frame()
             return
         elif status == "loading":
+            # Browser is linked but data hasn't arrived yet
+            # Status line: "Loading…"
             _show_stats_frame()
             v["cs_status"].set("Loading…")
             _clear()
         elif status == "waiting_login":
+            # Browser opened but user hasn't logged in to claude.ai
+            # Status line: "Waiting for login — check Chrome window…"
             _show_stats_frame()
             v["cs_status"].set("Waiting for login — check Chrome window…")
             _clear()
         elif status == "error":
+            # Fetch failed — status line shows truncated error message
             _show_stats_frame()
             short = (error[:60] + "…") if len(error) > 60 else error
             v["cs_status"].set(f"Error: {short}")
         elif status == "ok" and data:
+            # ── Linked & data available ──
+
+            # Status line: "Just fetched" or "Fetched N min ago"
             _show_stats_frame()
             if fetched_at:
                 age = int((datetime.now() - fetched_at).total_seconds() / 60)
@@ -660,56 +680,89 @@ class UsagePopup:
             else:
                 v["cs_status"].set("OK")
 
-            today = date.today()
-            week_start = today - timedelta(days=today.weekday())
-
-            d_total = data.get("daily_total", 0)
-            w_total = data.get("weekly_total", 0)
-            period_total = data.get("total", 0)
-            limit = period_total if period_total > 0 else 0
-
-            v["cs_d_head"].set(f"Today  ({today.strftime('%A, %b %d')})")
-            v["cs_d_total"].set(f"{d_total:,} tokens")
-            if limit and d_total:
-                pct = d_total / limit * 100
-                v["cs_d_pct"].set(f"  {pct:.1f}% of period total")
-                self._draw_bar(self._cs_d_bar, d_total, limit)
-            else:
-                v["cs_d_pct"].set("")
-                self._draw_bar(self._cs_d_bar, 0, 0)
-
-            v["cs_w_head"].set(f"This week  (since {week_start.strftime('%b %d')})")
-            v["cs_w_total"].set(f"{w_total:,} tokens")
-            if limit and w_total:
-                pct = w_total / limit * 100
-                v["cs_w_pct"].set(f"  {pct:.1f}% of period total")
-                self._draw_bar(self._cs_w_bar, w_total, limit)
-            else:
-                v["cs_w_pct"].set("")
-                self._draw_bar(self._cs_w_bar, 0, 0)
-
-            pe = data.get("period_end")
-            if pe:
+            # Helper to compute reset countdown strings from ISO timestamps, e.g. "Resets in 3h 12m (Mar 15)"
+            def _reset_str(resets_at: str | None) -> str:
+                if not resets_at:
+                    return ""
                 try:
-                    pe_dt = datetime.fromisoformat(pe.replace("Z", "+00:00"))
-                    secs = int((pe_dt - datetime.now(pe_dt.tzinfo)).total_seconds())
+                    dt = datetime.fromisoformat(resets_at.replace("Z", "+00:00"))
+                    secs = int((dt - datetime.now(dt.tzinfo)).total_seconds())
                     h, rem = divmod(max(secs, 0), 3600)
                     m = rem // 60
                     if h >= 24:
                         d = h // 24
-                        reset_str = (
-                            f"Resets in {d}d {h % 24}h  ({pe_dt.strftime('%b %d')})"
-                        )
+                        return f"Resets in {d}d {h % 24}h  ({dt.strftime('%b %d')})"
                     elif h > 0:
-                        reset_str = f"Resets in {h}h {m}m"
+                        return f"Resets in {h}h {m}m"
                     else:
-                        reset_str = f"Resets in {m}m"
-                    v["cs_reset"].set(f"  {reset_str}")
+                        return f"Resets in {m}m"
                 except Exception as exc:
-                    log.error("Error computing console reset countdown: %s", exc)
-                    v["cs_reset"].set("")
-            else:
+                    log.error("Error computing reset countdown: %s", exc)
+                    return ""
+
+            if data.get("format") == "utilization":
+                # ── Utilization format (five_hour / seven_day percentages) ──
+                fh = data.get("five_hour") or {}
+                sd = data.get("seven_day") or {}
+
+                fh_pct = fh.get("utilization")
+                sd_pct = sd.get("utilization")
+
+                v["cs_d_head"].set("5-hour window")
+                if fh_pct is not None:
+                    v["cs_d_total"].set(f"{fh_pct:.1f}% utilized")
+                    v["cs_d_pct"].set(f"  {_reset_str(fh.get('resets_at'))}")
+                    self._draw_bar(self._cs_d_bar, fh_pct, 100)
+                else:
+                    v["cs_d_total"].set("No data")
+                    v["cs_d_pct"].set("")
+                    self._draw_bar(self._cs_d_bar, 0, 0)
+
+                v["cs_w_head"].set("7-day window")
+                if sd_pct is not None:
+                    v["cs_w_total"].set(f"{sd_pct:.1f}% utilized")
+                    v["cs_w_pct"].set(f"  {_reset_str(sd.get('resets_at'))}")
+                    self._draw_bar(self._cs_w_bar, sd_pct, 100)
+                else:
+                    v["cs_w_total"].set("No data")
+                    v["cs_w_pct"].set("")
+                    self._draw_bar(self._cs_w_bar, 0, 0)
+
+                # Reset times are already shown inline under each row.
                 v["cs_reset"].set("")
+
+            else:
+                # ── Token format (legacy bucket-based responses) ──
+                today = date.today()
+                week_start = today - timedelta(days=today.weekday())
+
+                d_total = data.get("daily_total", 0)
+                w_total = data.get("weekly_total", 0)
+                period_total = data.get("total", 0)
+                limit = period_total if period_total > 0 else 0
+
+                v["cs_d_head"].set(f"Today  ({today.strftime('%A, %b %d')})")
+                v["cs_d_total"].set(f"{d_total:,} tokens")
+                if limit and d_total:
+                    pct = d_total / limit * 100
+                    v["cs_d_pct"].set(f"  {pct:.1f}% of period total")
+                    self._draw_bar(self._cs_d_bar, d_total, limit)
+                else:
+                    v["cs_d_pct"].set("")
+                    self._draw_bar(self._cs_d_bar, 0, 0)
+
+                v["cs_w_head"].set(f"This week  (since {week_start.strftime('%b %d')})")
+                v["cs_w_total"].set(f"{w_total:,} tokens")
+                if limit and w_total:
+                    pct = w_total / limit * 100
+                    v["cs_w_pct"].set(f"  {pct:.1f}% of period total")
+                    self._draw_bar(self._cs_w_bar, w_total, limit)
+                else:
+                    v["cs_w_pct"].set("")
+                    self._draw_bar(self._cs_w_bar, 0, 0)
+
+                rs = _reset_str(data.get("period_end"))
+                v["cs_reset"].set(f"  {rs}" if rs else "")
         log.debug("Finished UsagePopup._apply_console")
 
     # ── Countdown tick ────────────────────────────────────────────────────────
