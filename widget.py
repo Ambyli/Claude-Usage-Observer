@@ -35,6 +35,7 @@ class ClaudeUsageWidget:
         self._popup   = UsagePopup(
             console_available=self._fetcher is not None,
             on_link_browser=self._link_browser,
+            on_go_headless=self._go_headless,
         )
 
         try:
@@ -108,6 +109,13 @@ class ClaudeUsageWidget:
         if self._fetcher is not None:
             self._fetcher.launch(on_update=self._popup.apply_console)
         log.debug("Finished ClaudeUsageWidget._link_browser")
+
+    def _go_headless(self):
+        """Called when the user clicks 'Go Headless' in the popup."""
+        log.debug("Starting ClaudeUsageWidget._go_headless")
+        if self._fetcher is not None:
+            self._fetcher.go_headless()
+        log.debug("Finished ClaudeUsageWidget._go_headless")
 
     def _quit(self, icon, item):
         log.debug("Starting ClaudeUsageWidget._quit")
