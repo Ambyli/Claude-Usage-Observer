@@ -73,6 +73,7 @@ class BrowserLinker:
     def __init__(self):
         log.debug("Starting BrowserLinker.__init__")
         self._proc: subprocess.Popen | None = None
+        self._chrome_path: str | None = None
         self._data: dict | None = None
         self._error: str | None = None
         self._status = "unlinked"
@@ -123,17 +124,8 @@ class BrowserLinker:
             except FileNotFoundError:
                 pass
 
-        self._proc = subprocess.Popen(
-            [
-                chrome,
-                f"--remote-debugging-port={BROWSER_DEBUG_PORT}",
-                f"--remote-allow-origins=http://localhost:{BROWSER_DEBUG_PORT}",
-                f"--user-data-dir={BROWSER_PROFILE_DIR}",
-                "--no-first-run",
-                "--no-default-browser-check",
-                self.USAGE_URL,
-            ]
-        )
+        self._chrome_path = chrome
+        self._proc = self._start_chrome(chrome, headless=self._session_exists())
         log.debug("BrowserLinker.launch: Chrome started (pid=%s)", self._proc.pid)
 
         self._set_status("loading")
@@ -146,6 +138,26 @@ class BrowserLinker:
         log.debug("Starting BrowserLinker.fetch_now")
         self._reload_requested.set()
         log.debug("Finished BrowserLinker.fetch_now")
+
+    def go_headless(self):
+        """Terminate the current Chrome process and relaunch it headlessly.
+        Requires a prior successful fetch (sentinel must exist)."""
+        log.debug("Starting BrowserLinker.go_headless")
+        if not self._session_exists():
+            log.warning("BrowserLinker.go_headless: no session sentinel — cannot go headless")
+            return
+        if not self._chrome_path:
+            log.warning("BrowserLinker.go_headless: chrome path not stored")
+            return
+        if self._proc is not None:
+            try:
+                self._proc.terminate()
+            except Exception as exc:
+                log.warning("BrowserLinker.go_headless: error terminating Chrome: %s", exc)
+            self._proc = None
+        time.sleep(1)  # let Chrome fully exit before reopening the profile
+        self._proc = self._start_chrome(self._chrome_path, headless=True)
+        log.debug("BrowserLinker.go_headless: headless Chrome started (pid=%s)", self._proc.pid)
 
     def quit(self):
         """Terminate the managed Chrome process if one was started."""
@@ -180,6 +192,28 @@ class BrowserLinker:
             self._notify()
             try:
                 self._cdp_session()  # blocks until the WebSocket dies
+            except TimeoutError as exc:
+                # Login timed out — if we were running headless the session
+                # expired. Clear the sentinel and relaunch visibly so the user
+                # can log in again.
+                if self._session_exists() and self._chrome_path:
+                    log.warning(
+                        "BrowserLinker._loop: headless session expired, relaunching visibly"
+                    )
+                    self._clear_session()
+                    try:
+                        self._proc.terminate()
+                    except Exception:
+                        pass
+                    self._proc = self._start_chrome(self._chrome_path, headless=False)
+                    with self._lock:
+                        self._error = "Session expired — please log in again"
+                        self._status = "waiting_login"
+                else:
+                    with self._lock:
+                        self._error = str(exc)
+                        self._status = "error"
+                self._notify()
             except Exception as exc:
                 log.error("Error in BrowserLinker._loop: %s", exc)
                 with self._lock:
@@ -368,6 +402,17 @@ class BrowserLinker:
             # exists when the interceptor runs on the first page load.
             rpc("Runtime.addBinding", {"name": "__cdpNotify"})
 
+            # Hide navigator.webdriver so the site doesn't detect headless/automation.
+            rpc(
+                "Page.addScriptToEvaluateOnNewDocument",
+                {
+                    "source": (
+                        "Object.defineProperty(navigator, 'webdriver', "
+                        "{get: () => undefined});"
+                    )
+                },
+            )
+
             # Initial navigate + polling capture.
             data = _navigate_and_capture(self.USAGE_URL)
 
@@ -376,6 +421,7 @@ class BrowserLinker:
                 self._error = None
                 self._status = "ok"
                 self._fetched_at = datetime.now()
+            self._mark_session_ok()
             self._notify()
 
             # ── Persistent live-update loop ───────────────────────────────────
@@ -652,6 +698,56 @@ class BrowserLinker:
 
         log.debug("Finished BrowserLinker._parse_response: None")
         return None
+
+    # ── Headless helpers ──────────────────────────────────────────────────────
+
+    _SESSION_SENTINEL = "session_ok"
+
+    def _session_exists(self) -> bool:
+        """True if a previous successful fetch left a sentinel file."""
+        return os.path.exists(os.path.join(BROWSER_PROFILE_DIR, self._SESSION_SENTINEL))
+
+    def _mark_session_ok(self):
+        """Write the sentinel file so future launches can be headless."""
+        try:
+            open(os.path.join(BROWSER_PROFILE_DIR, self._SESSION_SENTINEL), "w").close()
+        except Exception as exc:
+            log.warning("BrowserLinker: could not write session sentinel: %s", exc)
+
+    def _clear_session(self):
+        """Remove the sentinel file (session expired / login required)."""
+        try:
+            os.remove(os.path.join(BROWSER_PROFILE_DIR, self._SESSION_SENTINEL))
+        except FileNotFoundError:
+            pass
+
+    def _start_chrome(self, chrome: str, headless: bool) -> subprocess.Popen:
+        args = [
+            chrome,
+            f"--remote-debugging-port={BROWSER_DEBUG_PORT}",
+            f"--remote-allow-origins=http://localhost:{BROWSER_DEBUG_PORT}",
+            f"--user-data-dir={BROWSER_PROFILE_DIR}",
+            "--no-first-run",
+            "--no-default-browser-check",
+        ]
+        if headless:
+            args += [
+                "--headless=new",
+                "--disable-gpu",
+                "--window-size=1920,1080",
+                # Suppress headless indicators that sites use to detect automation
+                "--disable-blink-features=AutomationControlled",
+                (
+                    "--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/134.0.0.0 Safari/537.36"
+                ),
+            ]
+            log.debug("BrowserLinker._start_chrome: launching headless")
+        else:
+            log.debug("BrowserLinker._start_chrome: launching visible")
+        args.append(self.USAGE_URL)
+        return subprocess.Popen(args, stderr=subprocess.DEVNULL)
 
     # ── Helpers ───────────────────────────────────────────────────────────────
 
