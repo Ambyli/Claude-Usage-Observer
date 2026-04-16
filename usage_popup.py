@@ -33,13 +33,14 @@ class UsagePopup:
     TRACK = "#2e2e38"
     GREEN = "#50d490"
 
-    def __init__(self, console_available: bool = False, on_link_browser=None):
+    def __init__(self, console_available: bool = False, on_link_browser=None, on_go_headless=None):
         log.debug(
             "Starting UsagePopup.__init__ console_available=%s", console_available
         )
         self._win: tk.Tk | None = None
         self._on_refresh = None
         self._on_link_browser = on_link_browser
+        self._on_go_headless = on_go_headless
         self._next_refresh_at: datetime | None = None
         self._refreshing: bool = False
 
@@ -57,6 +58,7 @@ class UsagePopup:
         self._cs_content: tk.Frame | None = None
         self._cs_link_frame: tk.Frame | None = None  # shown when unlinked
         self._cs_stats_frame: tk.Frame | None = None  # shown when linked
+        self._cs_headless_btn: tk.Button | None = None
         log.debug("Finished UsagePopup.__init__")
 
     # ── Public API ────────────────────────────────────────────────────────────
@@ -163,49 +165,52 @@ class UsagePopup:
         bar.bind("<ButtonPress-1>", _ds)
         bar.bind("<B1-Motion>", _dm)
 
-        # ── Today ──
-        self._divider(win)
+        # ── Token usage (collapsible, starts open) ──
+        tok_content = self._collapsible_section(win, "Token usage", initial_open=True)
+
+        # Today
         tk.Label(
-            win,
+            tok_content,
             textvariable=_sv("d_head"),
             font=("Segoe UI", 8, "bold"),
             fg="#a0a0b0",
             bg=self.BG,
             wraplength=270,
-        ).pack(anchor="w", padx=16)
-        self._var_row(win, "Input", "d_in")
-        self._var_row(win, "Output", "d_out")
-        self._var_row(win, "Total", "d_total", bold=True)
-        self._d_bar = self._make_bar(win)
+        ).pack(anchor="w", padx=16, pady=(6, 0))
+        self._var_row(tok_content, "Input", "d_in")
+        self._var_row(tok_content, "Output", "d_out")
+        self._var_row(tok_content, "Total", "d_total", bold=True)
+        self._d_bar = self._make_bar(tok_content)
         tk.Label(
-            win,
+            tok_content,
             textvariable=_sv("d_bar_lbl"),
             font=("Segoe UI", 7),
             fg="#808090",
             bg=self.BG,
         ).pack(anchor="w", padx=20)
 
-        # ── This week ──
-        self._divider(win)
+        # This week
+        tk.Frame(tok_content, height=4, bg=self.BG).pack()
         tk.Label(
-            win,
+            tok_content,
             textvariable=_sv("w_head"),
             font=("Segoe UI", 8, "bold"),
             fg="#a0a0b0",
             bg=self.BG,
             wraplength=270,
         ).pack(anchor="w", padx=16)
-        self._var_row(win, "Input", "w_in")
-        self._var_row(win, "Output", "w_out")
-        self._var_row(win, "Total", "w_total", bold=True)
-        self._w_bar = self._make_bar(win)
+        self._var_row(tok_content, "Input", "w_in")
+        self._var_row(tok_content, "Output", "w_out")
+        self._var_row(tok_content, "Total", "w_total", bold=True)
+        self._w_bar = self._make_bar(tok_content)
         tk.Label(
-            win,
+            tok_content,
             textvariable=_sv("w_bar_lbl"),
             font=("Segoe UI", 7),
             fg="#808090",
             bg=self.BG,
         ).pack(anchor="w", padx=20)
+        tk.Frame(tok_content, height=4, bg=self.BG).pack()
 
         # ── Last execution (collapsible, starts collapsed) ──
         ex_content = self._collapsible_section(
@@ -328,6 +333,23 @@ class UsagePopup:
                 fg="#606070",
                 bg=self.BG,
             ).pack(anchor="w", padx=20, pady=(4, 0))
+            # Go Headless button — only shown when status is ok
+            self._cs_headless_btn = tk.Button(
+                self._cs_stats_frame,
+                text="Go Headless",
+                command=self._on_go_headless_click,
+                font=("Segoe UI", 8),
+                bg="#2a2a36",
+                fg="#808090",
+                relief="flat",
+                bd=0,
+                padx=10,
+                pady=3,
+                activebackground="#3a3a48",
+                activeforeground="#c0c0d0",
+                cursor="hand2",
+            )
+            # (packed/hidden dynamically in _apply_console)
             tk.Frame(self._cs_stats_frame, height=6, bg=self.BG).pack()
 
         # ── Countdown ──
@@ -576,13 +598,19 @@ class UsagePopup:
             self._win.after(50, self._fit_window)
         log.debug("Finished UsagePopup._apply")
 
-    # ── Link-browser button ───────────────────────────────────────────────────
+    # ── Link-browser / Go-headless buttons ───────────────────────────────────
 
     def _on_link_click(self):
         log.debug("Starting UsagePopup._on_link_click")
         if self._on_link_browser:
             threading.Thread(target=self._on_link_browser, daemon=True).start()
         log.debug("Finished UsagePopup._on_link_click")
+
+    def _on_go_headless_click(self):
+        log.debug("Starting UsagePopup._on_go_headless_click")
+        if self._on_go_headless:
+            threading.Thread(target=self._on_go_headless, daemon=True).start()
+        log.debug("Finished UsagePopup._on_go_headless_click")
 
     # ── Account-stats update (called from BrowserLinker thread) ──────────────
 
@@ -646,9 +674,18 @@ class UsagePopup:
         # Each branch controls which frame is visible and what the status
         # line (small grey text at the top of the stats frame) shows.
 
+        def _show_headless_btn(visible: bool):
+            if self._cs_headless_btn is None:
+                return
+            if visible and not self._cs_headless_btn.winfo_ismapped():
+                self._cs_headless_btn.pack(anchor="w", padx=16, pady=(6, 0))
+            elif not visible and self._cs_headless_btn.winfo_ismapped():
+                self._cs_headless_btn.pack_forget()
+
         if status == "unlinked":
             # No browser linked yet — show the "Link Browser" prompt
             _show_link_frame()
+            _show_headless_btn(False)
             return
         elif status == "loading":
             # Browser is linked but data hasn't arrived yet
@@ -656,17 +693,20 @@ class UsagePopup:
             _show_stats_frame()
             v["cs_status"].set("Loading…")
             _clear()
+            _show_headless_btn(False)
         elif status == "waiting_login":
             # Browser opened but user hasn't logged in to claude.ai
             # Status line: "Waiting for login — check Chrome window…"
             _show_stats_frame()
             v["cs_status"].set("Waiting for login — check Chrome window…")
             _clear()
+            _show_headless_btn(False)
         elif status == "error":
             # Fetch failed — status line shows truncated error message
             _show_stats_frame()
             short = (error[:60] + "…") if len(error) > 60 else error
             v["cs_status"].set(f"Error: {short}")
+            _show_headless_btn(False)
         elif status == "ok" and data:
             # ── Linked & data available ──
 
@@ -763,6 +803,7 @@ class UsagePopup:
 
                 rs = _reset_str(data.get("period_end"))
                 v["cs_reset"].set(f"  {rs}" if rs else "")
+            _show_headless_btn(not state.get("headless", False))
         log.debug("Finished UsagePopup._apply_console")
 
     # ── Countdown tick ────────────────────────────────────────────────────────
