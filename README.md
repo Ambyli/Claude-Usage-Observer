@@ -186,6 +186,17 @@ Your session cookies are saved to `~/.claude_widget/chrome_profile/` and reused 
 
 ### What is displayed
 
+The popup adapts to whichever response format the API returns.
+
+**Utilization format** (current API shape):
+
+| Row | Description |
+|---|---|
+| 5-hour window | Percentage of your 5-hour usage allowance consumed, with a countdown to when it resets |
+| 7-day window | Percentage of your 7-day usage allowance consumed, with a countdown to when it resets |
+
+**Token format** (legacy fallback, shown when the API returns raw token counts instead):
+
 | Row | Description |
 |---|---|
 | Today | Tokens used today against the period total |
@@ -204,7 +215,7 @@ The interceptor patches `window.fetch` and `XMLHttpRequest` so that every JSON r
 - The response body is **cloned before reading**, so the page still gets its data unmodified
 - The interceptor is **guarded against double-injection** — re-running it on an already-patched page is a no-op
 
-Once the page has loaded, the widget reads `window._capturedResponses` via CDP, sorts the entries so URL-hinted responses (containing words like `usage`, `token`, `billing`) float to the top, and parses whichever response matches the expected token-bucket shape.
+Once the page has loaded, the widget reads `window._capturedResponses` via CDP, sorts the entries so URL-hinted responses (containing words like `usage`, `token`, `billing`) float to the top, and parses whichever response matches a known shape — utilization blocks (`five_hour`, `seven_day`) are tried first, falling back to raw token-bucket fields.
 
 Because `navigator.webdriver` is not set and no ChromeDriver process is involved, the browser looks identical to a normal user session — Cloudflare and similar bot-detection layers do not trigger.
 
