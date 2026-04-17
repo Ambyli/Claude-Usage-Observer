@@ -19,6 +19,7 @@ import tkinter as tk
 from datetime import date, datetime, timedelta
 
 from logging_setup import log
+import ui_state
 
 
 class UsagePopup:
@@ -33,7 +34,9 @@ class UsagePopup:
     TRACK = "#2e2e38"
     GREEN = "#50d490"
 
-    def __init__(self, console_available: bool = False, on_link_browser=None, on_go_headless=None):
+    def __init__(
+        self, console_available: bool = False, on_link_browser=None, on_go_headless=None
+    ):
         log.debug(
             "Starting UsagePopup.__init__ console_available=%s", console_available
         )
@@ -43,6 +46,10 @@ class UsagePopup:
         self._on_go_headless = on_go_headless
         self._next_refresh_at: datetime | None = None
         self._refreshing: bool = False
+        self._cs_fetched_at: datetime | None = None
+
+        # Persistent UI state (section open/closed)
+        self._ui_state: dict = ui_state.load()
 
         # StringVars populated once the window is built
         self._vars: dict[str, tk.StringVar] = {}
@@ -59,6 +66,7 @@ class UsagePopup:
         self._cs_link_frame: tk.Frame | None = None  # shown when unlinked
         self._cs_stats_frame: tk.Frame | None = None  # shown when linked
         self._cs_headless_btn: tk.Button | None = None
+        self._launch_pos: tuple[int, int] | None = None  # position set on launch
         log.debug("Finished UsagePopup.__init__")
 
     # ── Public API ────────────────────────────────────────────────────────────
@@ -107,6 +115,13 @@ class UsagePopup:
             self._win.after(0, lambda: self._apply(usage, error))
         log.debug("Finished UsagePopup.update")
 
+    def reposition(self):
+        """Thread-safe: snap the window back to its default anchored position."""
+        log.debug("Starting UsagePopup.reposition")
+        if self._win and self._win.winfo_exists():
+            self._win.after(0, lambda: self._fit_window(reposition=True))
+        log.debug("Finished UsagePopup.reposition")
+
     def start_refresh_display(self):
         """Thread-safe: show 'Refreshing…' immediately and pause the tick loop."""
         log.debug("Starting UsagePopup.start_refresh_display")
@@ -152,6 +167,7 @@ class UsagePopup:
             relief="flat",
             bd=0,
             padx=8,
+            cursor="hand2",
             activebackground="#e05050",
             activeforeground="#ffffff",
         ).pack(side="right", pady=4, padx=4)
@@ -160,7 +176,11 @@ class UsagePopup:
             win._dx, win._dy = e.x, e.y
 
         def _dm(e):
-            win.geometry(f"+{win.winfo_x()+e.x-win._dx}+{win.winfo_y()+e.y-win._dy}")
+            nx, ny = win.winfo_x() + e.x - win._dx, win.winfo_y() + e.y - win._dy
+            win.geometry(f"+{nx}+{ny}")
+            self._ui_state["window_x"] = nx
+            self._ui_state["window_y"] = ny
+            ui_state.save(self._ui_state)
 
         bar.bind("<ButtonPress-1>", _ds)
         bar.bind("<B1-Motion>", _dm)
@@ -366,9 +386,9 @@ class UsagePopup:
 
     # ── Window sizing / collapsible helpers ──────────────────────────────────
 
-    def _fit_window(self):
-        """Resize and reposition the window to fit its current content."""
-        log.debug("Starting UsagePopup._fit_window")
+    def _fit_window(self, reposition: bool = False):
+        """Resize (and optionally reposition) the window to fit its current content."""
+        log.debug("Starting UsagePopup._fit_window reposition=%s", reposition)
         if not (self._win and self._win.winfo_exists()):
             log.debug("Finished UsagePopup._fit_window (window does not exist)")
             return
@@ -378,27 +398,65 @@ class UsagePopup:
         try:
             self._win.update_idletasks()
             h = self._win.winfo_reqheight()
-            try:
-                import ctypes
+            # Only auto-reposition if we're currently at the launch position (or if we don't have one yet).
+            cur_x, cur_y = self._win.winfo_x(), self._win.winfo_y()
+            # If the window is currently at the launch position (or we don't have one yet), snap it to the bottom-right corner above the system tray.
+            if (
+                reposition
+                or (cur_x, cur_y) == self._launch_pos
+                or self._launch_pos is None
+            ):
 
-                class _RECT(ctypes.Structure):
-                    _fields_ = [
-                        ("left", ctypes.c_long),
-                        ("top", ctypes.c_long),
-                        ("right", ctypes.c_long),
-                        ("bottom", ctypes.c_long),
-                    ]
+                # caclulate the taskbar position and size to snap above it; fallback to screen bottom-right if that fails for any reason (multi-monitor setups can be weird)
+                try:
+                    import ctypes
 
-                rc = _RECT()
-                ctypes.windll.user32.SystemParametersInfoW(48, 0, ctypes.byref(rc), 0)
-                x, y = rc.right - 300 - 4, rc.bottom - h - 4
-            except Exception as exc:
-                log.error("Error getting taskbar bounds in _fit_window: %s", exc)
-                sw, sh = self._win.winfo_screenwidth(), self._win.winfo_screenheight()
-                x, y = sw - 300 - 4, sh - h - 4
-            self._win.geometry(f"300x{h}+{x}+{y}")
+                    class _RECT(ctypes.Structure):
+                        _fields_ = [
+                            ("left", ctypes.c_long),
+                            ("top", ctypes.c_long),
+                            ("right", ctypes.c_long),
+                            ("bottom", ctypes.c_long),
+                        ]
+
+                    rc = _RECT()
+                    ctypes.windll.user32.SystemParametersInfoW(
+                        48, 0, ctypes.byref(rc), 0
+                    )
+                    x, y = rc.right - 300 - 4, rc.bottom - h - 4
+                except Exception as exc:
+                    log.error(
+                        "Error getting taskbar bounds in UsagePopup._fit_window: %s",
+                        exc,
+                    )
+                    sw, sh = (
+                        self._win.winfo_screenwidth(),
+                        self._win.winfo_screenheight(),
+                    )
+                    x, y = sw - 300 - 4, sh - h - 4
+                self._win.geometry(f"300x{h}+{x}+{y}")
+
+                # "Reposition Window" — save the snapped position as the new saved position
+                # Also save the position if we have adjusted and we are at the launch position.
+                if reposition or (cur_x, cur_y) == self._launch_pos:
+                    self._ui_state["window_x"] = x
+                    self._ui_state["window_y"] = y
+                    ui_state.save(self._ui_state)
+                # First launch — apply saved position if present (overrides taskbar snap)
+                elif self._launch_pos is None:
+                    sx, sy = self._ui_state["window_x"], self._ui_state["window_y"]
+                    if sx is not None and sy is not None:
+                        self._win.geometry(f"300x{h}+{sx}+{sy}")
+                        self._launch_pos = (sx, sy)
+
+                # store the default launch position (used to determine whether to auto-snap in future) if we don't have one yet or if we're currently at it
+                self._launch_pos = (x, y)
+            else:
+                x = self._win.winfo_x()
+                y = self._win.winfo_y()
+                self._win.geometry(f"300x{h}+{x}+{y}")
         except Exception as exc:
-            log.error("Error in _fit_window: %s", exc)
+            log.error("Error in UsagePopup._fit_window: %s", exc)
         log.debug("Finished UsagePopup._fit_window")
 
     def _collapsible_section(
@@ -410,13 +468,17 @@ class UsagePopup:
             title,
             initial_open,
         )
+
+        state_key = f"section_open:{title}"
+        is_open = self._ui_state.get(state_key, initial_open)
+
         tk.Frame(parent, height=1, bg="#3a3a45").pack(fill="x", padx=16, pady=(5, 0))
 
         content = tk.Frame(parent, bg=self.BG)
 
         btn = tk.Button(
             parent,
-            text=f"{'▼' if initial_open else '▶'}  {title}",
+            text=f"{'▼' if is_open else '▶'}  {title}",
             font=("Segoe UI", 8, "bold"),
             fg="#a0a0b0",
             bg="#13131a",
@@ -436,14 +498,17 @@ class UsagePopup:
             if content.winfo_ismapped():
                 content.pack_forget()
                 btn.config(text=f"▶  {title}")
+                self._ui_state[state_key] = False
             else:
                 content.pack(fill="x", after=btn)
                 btn.config(text=f"▼  {title}")
+                self._ui_state[state_key] = True
+            ui_state.save(self._ui_state)
             self._fit_window()
             log.debug("Finished toggle for section %r", title)
 
         btn.config(command=toggle)
-        if initial_open:
+        if is_open:
             content.pack(fill="x", after=btn)
 
         log.debug("Finished UsagePopup._collapsible_section title=%r", title)
@@ -595,7 +660,7 @@ class UsagePopup:
                     fg="#505060",
                     bg=self.BG,
                 ).pack(anchor="w", padx=20, pady=6)
-            self._win.after(50, self._fit_window)
+            self._win.after(50, lambda: self._fit_window())
         log.debug("Finished UsagePopup._apply")
 
     # ── Link-browser / Go-headless buttons ───────────────────────────────────
@@ -643,7 +708,7 @@ class UsagePopup:
                 self._cs_link_frame.pack(fill="x", padx=16, pady=(8, 6))
             if self._cs_stats_frame and self._cs_stats_frame.winfo_ismapped():
                 self._cs_stats_frame.pack_forget()
-            self._win.after(50, self._fit_window)
+            self._win.after(50, lambda: self._fit_window())
 
         def _show_stats_frame():
             # Shows: status line, daily section, weekly section, reset countdown
@@ -651,7 +716,7 @@ class UsagePopup:
                 self._cs_link_frame.pack_forget()
             if self._cs_stats_frame and not self._cs_stats_frame.winfo_ismapped():
                 self._cs_stats_frame.pack(fill="x")
-            self._win.after(50, self._fit_window)
+            self._win.after(50, lambda: self._fit_window())
 
         def _clear():
             # Resets all stat labels to "—" and empties both progress bars
@@ -713,10 +778,8 @@ class UsagePopup:
             # Status line: "Just fetched" or "Fetched N min ago"
             _show_stats_frame()
             if fetched_at:
-                age = int((datetime.now() - fetched_at).total_seconds() / 60)
-                v["cs_status"].set(
-                    "Just fetched" if age < 1 else f"Fetched {age} min ago"
-                )
+                self._cs_fetched_at = fetched_at
+                self._update_cs_status()
             else:
                 v["cs_status"].set("OK")
 
@@ -808,12 +871,33 @@ class UsagePopup:
 
     # ── Countdown tick ────────────────────────────────────────────────────────
 
+    def notify_cs_fetching(self):
+        """Thread-safe: called when a new account-stats fetch is triggered."""
+        self._cs_fetched_at = None
+        if self._win and self._win.winfo_exists() and "cs_status" in self._vars:
+            self._win.after(0, lambda: self._vars["cs_status"].set("Fetching…"))
+
+    def _update_cs_status(self):
+        if not self._cs_fetched_at or "cs_status" not in self._vars:
+            return
+        elapsed = int((datetime.now() - self._cs_fetched_at).total_seconds())
+        if elapsed < 60:
+            self._vars["cs_status"].set(f"Fetched {elapsed}s ago")
+        elif elapsed < 3600:
+            m, s = divmod(elapsed, 60)
+            self._vars["cs_status"].set(f"Fetched {m}m {s:02d}s ago")
+        else:
+            h, rem = divmod(elapsed, 3600)
+            m = rem // 60
+            self._vars["cs_status"].set(f"Fetched {h}h {m}m ago")
+
     def _tick(self):
         # log.debug("Starting UsagePopup._tick")
         if not (self._win and self._win.winfo_exists()):
             log.debug("Finished UsagePopup._tick (window gone)")
             return
         if self._refreshing:
+            self._update_cs_status()
             self._win.after(1000, self._tick)
             log.debug("Finished UsagePopup._tick (refreshing, rescheduled)")
             return
@@ -830,6 +914,7 @@ class UsagePopup:
             self._vars["countdown"].set(f"Refreshes in {m}:{s:02d}")
         else:
             self._vars["countdown"].set("Refresh time unknown")
+        self._update_cs_status()
         self._win.after(1000, self._tick)
         # log.debug("Finished UsagePopup._tick")
 

@@ -27,14 +27,13 @@ The widget appears in your system tray. Click the icon to open the popup; right-
 
 | Section | Notes |
 |---|---|
-| **Today** | Tokens used so far today with a progress bar against your rolling daily average |
-| **This week** | Tokens used Monday through today with a progress bar against your rolling weekly average |
+| **Token usage** | Collapsible (starts open) — contains Today and This week sub-sections, each with input/output/total rows, a progress bar, and a percentage label |
 | **Last execution** | Collapsible — timestamp and token breakdown of the most recent completed assistant turn |
 | **Per project — Today** | Collapsible — each project's share of today's usage as a bar and percentage |
-| **Account stats — claude.ai** | Collapsible — account-level token totals read from claude.ai/settings/usage via a linked Chrome window (requires `requests` + `websocket-client`) |
+| **Account stats — claude.ai** | Collapsible — account-level token totals read from claude.ai/settings/usage via a linked Chrome window (requires `requests` + `websocket-client`); includes a **Go Headless** button to hide the Chrome window once data is flowing |
 | **Countdown** | Seconds until next auto-refresh; shows "Refreshing…" during a refresh |
 
-The **Last execution** section starts collapsed; **Per project** and **Account stats** start expanded once data is available. Click any header to toggle.
+The **Last execution** section starts collapsed; **Token usage**, **Per project**, and **Account stats** start expanded once data is available. Click any header to toggle.
 
 Closing the popup with ✕ hides it without destroying it. Clicking the tray icon again restores it instantly.
 
@@ -156,6 +155,7 @@ Going over 100% is possible on heavy days — the bar fills completely and the p
 - Data is re-read from disk every **5 minutes** (configurable via `REFRESH_INTERVAL_SECONDS` in the script).
 - The popup shows a live countdown, ticking every second.
 - When a refresh starts — whether from the countdown or "Refresh Now" — the countdown label changes to **"Refreshing…"** and switches back to the new countdown when done.
+- **"Refresh Now"** also triggers an immediate fetch from the account stats fetcher (if linked), so both local and account data update together.
 - The tray icon dot turns **yellow** while refreshing and **red** on error.
 - Background refreshes continue even while the popup is hidden.
 
@@ -304,7 +304,11 @@ If both accounts have been used in the same working directory, their sessions wi
 | `config.py` | `.env` loader and all configuration constants |
 | `logging_setup.py` | Shared logger used by all modules |
 | `usage_parser.py` | JSONL scanner — `get_usage_summary()` |
-| `usage_fetcher.py` | `BrowserLinker` — CDP browser link and account stats |
+| `usage_fetcher.py` | `BrowserLinker` — orchestrates the browser link and account stats polling |
+| `chrome_launcher.py` | Finds, launches, and manages the Chrome process; handles the session sentinel |
+| `cdp_client.py` | CDP session management — persistent WebSocket connection to Chrome's debug endpoint |
+| `cdp_spy.py` | Injects the fetch/XHR interceptor into the active tab and reads captured responses |
+| `response_parser.py` | Parses raw API response bodies captured from claude.ai into the display dict |
 | `usage_popup.py` | `UsagePopup` — the tkinter popup window |
 | `tray_icon.py` | `make_tray_icon()` — generates the tray icon image |
 | `startup.py` | Windows registry helpers for run-at-login |

@@ -52,6 +52,7 @@ class ClaudeUsageWidget:
             menu=pystray.Menu(
                 pystray.MenuItem("Show Usage", self._on_click, default=True),
                 pystray.MenuItem("Refresh Now", self._refresh_now),
+                pystray.MenuItem("Reposition Window", self._reposition_window),
                 pystray.Menu.SEPARATOR,
                 pystray.MenuItem(
                     lambda item: "Remove from Startup" if startup_registered() else "Add to Startup",
@@ -95,6 +96,11 @@ class ClaudeUsageWidget:
         threading.Thread(target=_do, daemon=True).start()
         log.debug("Finished ClaudeUsageWidget._refresh_now")
 
+    def _reposition_window(self, _icon=None, _item=None):
+        log.debug("Starting ClaudeUsageWidget._reposition_window")
+        self._popup.reposition()
+        log.debug("Finished ClaudeUsageWidget._reposition_window")
+
     def _toggle_startup(self, icon, item):
         log.debug("Starting ClaudeUsageWidget._toggle_startup")
         if startup_registered():
@@ -132,6 +138,7 @@ class ClaudeUsageWidget:
         self._icon.icon  = make_tray_icon("loading")
         self._icon.title = "Claude Usage — refreshing..."
         if self._fetcher is not None:
+            self._popup.notify_cs_fetching()
             self._fetcher.fetch_now()
         try:
             self._usage  = get_usage_summary()
