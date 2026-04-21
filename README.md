@@ -31,6 +31,7 @@ The widget appears in your system tray. Click the icon to open the popup; right-
 | **Last execution** | Collapsible — timestamp and token breakdown of the most recent completed assistant turn |
 | **Per project — Today** | Collapsible — each project's share of today's usage as a bar and percentage |
 | **Account stats — claude.ai** | Collapsible — account-level token totals read from claude.ai/settings/usage via a linked Chrome window (requires `requests` + `websocket-client`); includes a **Go Headless** button to hide the Chrome window once data is flowing |
+| **LLM Backend** | Collapsible — toggle Claude Code between the Anthropic API and a local LLM (localhost:8001), and launch/stop a `llama-server` process with live log output |
 | **Countdown** | Seconds until next auto-refresh; shows "Refreshing…" during a refresh |
 
 The **Last execution** section starts collapsed; **Token usage**, **Per project**, and **Account stats** start expanded once data is available. Click any header to toggle.
@@ -225,6 +226,25 @@ Account stats refresh every **30 minutes** by default, independently of the 5-mi
 
 ---
 
+## LLM Backend — local server (llama-server / ollama)
+
+The **LLM Backend** section in the popup lets you:
+
+1. **Switch** Claude Code between the Anthropic API and a local LLM running on `localhost:8001` (writes the necessary overrides into `~/.claude/settings.json` and `~/.claude.json`).
+2. **Launch / Stop** the `llama-server` process without leaving the widget.  Server output streams into the log box in real time.
+
+### Setup
+
+Set at least one of the following in `.env`:
+
+Set `LLAMA_SERVER_CMD` in `.env` to the full launch command including all flags:
+
+```env
+LLAMA_SERVER_CMD=C:\Users\username\ollama\llama-server.exe --model ~/unsloth/Qwen3.5-4B-GGUF/Qwen3.5-4B-UD-Q4_K_XL.gguf --alias "unsloth/Qwen3.5-4B" --temp 0.6 --top-p 0.95 --top-k 20 --min-p 0.00 --port 8001 --kv-unified --cache-type-k q8_0 --cache-type-v q8_0 --flash-attn on --fit on --ctx-size 131072
+```
+
+---
+
 ## Windows startup
 
 Use **Add to Startup** in the right-click menu to register the widget to launch automatically at login. It runs via `pythonw.exe` so no console window appears. **Remove from Startup** undoes this.
@@ -241,6 +261,10 @@ HKCU\Software\Microsoft\Windows\CurrentVersion\Run
 Settings live in `.env` in the same directory as the script:
 
 ```env
+# Full command used to launch llama-server (required for the Launch Server button).
+# Split on whitespace and passed directly to the OS — no shell interpolation.
+LLAMA_SERVER_CMD=C:\path\to\llama-server.exe --model ~/unsloth/Qwen3.5-4B-GGUF/Qwen3.5-4B-UD-Q4_K_XL.gguf --alias "unsloth/Qwen3.5-4B" --temp 0.6 --top-p 0.95 --top-k 20 --min-p 0.00 --port 8001 --kv-unified --cache-type-k q8_0 --cache-type-v q8_0 --flash-attn on --fit on --ctx-size 131072
+
 # Comma-separated path prefixes (case-insensitive).
 # Only sessions whose working directory starts with one of these are counted.
 # Leave blank to include all sessions.

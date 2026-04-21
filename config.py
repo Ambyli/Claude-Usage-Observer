@@ -46,6 +46,14 @@ CONSOLE_REFRESH_MINUTES = int(os.environ.get("CONSOLE_REFRESH_MINUTES", "30"))
 BROWSER_PROFILE_DIR     = os.path.join(os.path.expanduser("~"), ".claude_widget", "chrome_profile")
 BROWSER_DEBUG_PORT      = int(os.environ.get("BROWSER_DEBUG_PORT", "9222"))
 
+# ── Local LLM server (llama-server / ollama) ──────────────────────────────────
+
+# Full command used to launch llama-server, including all flags.
+# Split on whitespace and passed directly to the OS (no shell).
+# Example: C:\ollama\llama-server.exe --model ~/model.gguf --port 8001
+LLAMA_SERVER_CMD = os.environ.get("LLAMA_SERVER_CMD", "")
+LLM_LOG_MAX_LINES = int(os.environ.get("LLM_LOG_MAX_LINES", "200"))
+
 # ── Logging ───────────────────────────────────────────────────────────────────
 
 DEBUG_LOGGING = os.environ.get("DEBUG_LOGGING", "false").lower() == "true"

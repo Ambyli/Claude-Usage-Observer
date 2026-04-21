@@ -16,10 +16,13 @@ UsagePopup(console_available)
 
 import threading
 import tkinter as tk
+from tkinter import ttk
 from datetime import date, datetime, timedelta
 
 from logging_setup import log
 import ui_state
+import llm_backend
+import config
 
 
 class UsagePopup:
@@ -67,6 +70,10 @@ class UsagePopup:
         self._cs_stats_frame: tk.Frame | None = None  # shown when linked
         self._cs_headless_btn: tk.Button | None = None
         self._launch_pos: tuple[int, int] | None = None  # position set on launch
+        self._llm_content: tk.Frame | None = None
+        self._llm_status_lbl: tk.Label | None = None
+        self._llm_active: bool = False
+        self._server_log: tk.Text | None = None
         log.debug("Finished UsagePopup.__init__")
 
     # ── Public API ────────────────────────────────────────────────────────────
@@ -372,6 +379,12 @@ class UsagePopup:
             # (packed/hidden dynamically in _apply_console)
             tk.Frame(self._cs_stats_frame, height=6, bg=self.BG).pack()
 
+        # ── LLM Backend toggle ──
+        self._llm_content = self._collapsible_section(
+            win, "LLM Backend", initial_open=False
+        )
+        self._build_llm_section(self._llm_content, _sv)
+
         # ── Countdown ──
         self._divider(win)
         tk.Label(
@@ -513,6 +526,164 @@ class UsagePopup:
 
         log.debug("Finished UsagePopup._collapsible_section title=%r", title)
         return content
+
+    # ── LLM Backend section ───────────────────────────────────────────────────
+
+    def _build_llm_section(self, parent: tk.Frame, _sv):
+        active = llm_backend.is_local_llm_active()
+        self._vars["llm_status"] = tk.StringVar(
+            value=(
+                "Active: Local LLM  (localhost:8001)" if active else "Active: Claude API"
+            )
+        )
+        self._llm_active = active
+
+        status_lbl = tk.Label(
+            parent,
+            textvariable=self._vars["llm_status"],
+            font=("Segoe UI", 9, "bold"),
+            fg="#50d490" if active else "#a0a0b0",
+            bg=self.BG,
+            anchor="w",
+        )
+        status_lbl.pack(anchor="w", padx=16, pady=(8, 4))
+        self._llm_status_lbl = status_lbl
+
+        toggle_btn = tk.Button(
+            parent,
+            text="Switch to Claude API" if active else "Switch to Local LLM",
+            font=("Segoe UI", 9),
+            bg="#2a5a8a",
+            fg="#ffffff",
+            relief="flat",
+            bd=0,
+            padx=10,
+            pady=4,
+            cursor="hand2",
+            activebackground="#3a6a9a",
+            activeforeground="#ffffff",
+        )
+        toggle_btn.pack(anchor="w", padx=16, pady=(0, 8))
+
+        def _toggle():
+            if self._llm_active:
+                llm_backend.deactivate_local_llm()
+                self._llm_active = False
+                self._vars["llm_status"].set("Active: Claude API")
+                status_lbl.config(fg="#a0a0b0")
+                toggle_btn.config(text="Switch to Local LLM")
+            else:
+                llm_backend.activate_local_llm()
+                self._llm_active = True
+                self._vars["llm_status"].set("Active: Local LLM  (localhost:8001)")
+                status_lbl.config(fg="#50d490")
+                toggle_btn.config(text="Switch to Claude API")
+
+        toggle_btn.config(command=_toggle)
+
+        # ── Server launch / stop ──────────────────────────────────────────────
+
+        self._vars["server_status"] = tk.StringVar(
+            value="Server: running" if llm_backend.is_server_running() else "Server: stopped"
+        )
+        server_status_lbl = tk.Label(
+            parent,
+            textvariable=self._vars["server_status"],
+            font=("Segoe UI", 9),
+            fg="#50d490" if llm_backend.is_server_running() else "#a0a0b0",
+            bg=self.BG,
+            anchor="w",
+        )
+        server_status_lbl.pack(anchor="w", padx=16, pady=(4, 2))
+
+        server_btn = tk.Button(
+            parent,
+            text="Stop Server" if llm_backend.is_server_running() else "Launch Server",
+            font=("Segoe UI", 9),
+            bg="#3a7a4a",
+            fg="#ffffff",
+            relief="flat",
+            bd=0,
+            padx=10,
+            pady=4,
+            cursor="hand2",
+            activebackground="#4a8a5a",
+            activeforeground="#ffffff",
+        )
+        server_btn.pack(anchor="w", padx=16, pady=(0, 6))
+
+        # Scrollable log box for server output
+        log_frame = tk.Frame(parent, bg=self.BG)
+        log_frame.pack(fill="x", padx=16, pady=(0, 8))
+        style = ttk.Style()
+        style.theme_use("default")
+        style.configure(
+            "LLMLog.Vertical.TScrollbar",
+            troughcolor="#13131a",
+            background="#44445a",
+            bordercolor="#13131a",
+            arrowcolor="#13131a",
+            relief="flat",
+            borderwidth=0,
+            padding=0,
+            width=6,
+            arrowsize=0,
+        )
+        style.map(
+            "LLMLog.Vertical.TScrollbar",
+            background=[("active", "#6060a0"), ("!active", "#44445a")],
+        )
+        scrollbar = ttk.Scrollbar(log_frame, orient="vertical", style="LLMLog.Vertical.TScrollbar")
+        self._server_log = tk.Text(
+            log_frame,
+            height=6,
+            width=36,
+            bg="#13131a",
+            fg="#c0c0d0",
+            font=("Consolas", 7),
+            relief="flat",
+            bd=0,
+            wrap="none",
+            state="disabled",
+            yscrollcommand=scrollbar.set,
+        )
+        scrollbar.config(command=self._server_log.yview)
+        scrollbar.pack(side="right", fill="y")
+        self._server_log.pack(side="left", fill="x", expand=True)
+
+        def _append_log(line: str):
+            if self._win and self._win.winfo_exists():
+                self._win.after(0, lambda l=line: _do_append(l))
+
+        def _do_append(line: str):
+            self._server_log.config(state="normal")
+            self._server_log.insert("end", line + "\n")
+            if int(self._server_log.index("end-1c").split(".")[0]) > config.LLM_LOG_MAX_LINES:
+                self._server_log.delete("1.0", "2.0")
+            self._server_log.see("end")
+            self._server_log.config(state="disabled")
+
+        def _toggle_server():
+            if llm_backend.is_server_running():
+                llm_backend.stop_server()
+                self._vars["server_status"].set("Server: stopped")
+                server_status_lbl.config(fg="#a0a0b0")
+                server_btn.config(text="Launch Server", bg="#3a7a4a")
+                _do_append("--- server stopped ---")
+            else:
+                server_btn.config(state="disabled")
+                err = llm_backend.launch_server(on_line=_append_log)
+                server_btn.config(state="normal")
+                if err:
+                    _do_append(f"ERROR: {err}")
+                    self._vars["server_status"].set("Server: error")
+                    server_status_lbl.config(fg="#e05050")
+                else:
+                    self._vars["server_status"].set("Server: running")
+                    server_status_lbl.config(fg="#50d490")
+                    server_btn.config(text="Stop Server", bg="#7a3a3a")
+
+        server_btn.config(command=_toggle_server)
 
     # ── Data application (called on every refresh) ────────────────────────────
 
