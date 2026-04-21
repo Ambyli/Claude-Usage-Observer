@@ -235,13 +235,55 @@ The **LLM Backend** section in the popup lets you:
 
 ### Setup
 
-Set at least one of the following in `.env`:
-
 Set `LLAMA_SERVER_CMD` in `.env` to the full launch command including all flags:
 
 ```env
-LLAMA_SERVER_CMD=C:\Users\username\ollama\llama-server.exe --model ~/unsloth/Qwen3.5-4B-GGUF/Qwen3.5-4B-UD-Q4_K_XL.gguf --alias "unsloth/Qwen3.5-4B" --temp 0.6 --top-p 0.95 --top-k 20 --min-p 0.00 --port 8001 --kv-unified --cache-type-k q8_0 --cache-type-v q8_0 --flash-attn on --fit on --ctx-size 131072
+LLAMA_SERVER_CMD=C:\Users\username\llama.cpp\build\bin\Release\llama-server.exe --model C:\Users\username\unsloth\Qwen3.5-4B-GGUF\Qwen3.5-4B-UD-Q4_K_XL.gguf --alias "unsloth/Qwen3.5-4B" --temp 0.6 --top-p 0.95 --top-k 20 --min-p 0.00 --port 8001 --kv-unified --cache-type-k q8_0 --cache-type-v q8_0 --flash-attn on --fit on --ctx-size 131072
 ```
+
+The `--alias` value must match the model name Claude Code will request. The server must listen on port `8001` (the port the widget points `ANTHROPIC_BASE_URL` at).
+
+### Launching the server
+
+Use the **Launch Server** button in the LLM Backend section. Output from `llama-server` streams into the log box in real time. Click **Stop Server** to terminate the process.
+
+You can also start the server manually before opening the widget — the widget detects whether a process it launched is running, but it will still toggle the Claude Code config correctly regardless.
+
+### Switching Claude Code between Anthropic API and local LLM
+
+The **toggle button** in the LLM Backend section switches between two modes by rewriting two files:
+
+| File | Local LLM (on) | Anthropic API (off) |
+|---|---|---|
+| `~/.claude/settings.json` | Sets `env.ANTHROPIC_BASE_URL=http://localhost:8001` and `env.CLAUDE_CODE_ATTRIBUTION_HEADER=0`; sets `claudeCode.disableLoginPrompt=true` | Removes those keys |
+| `~/.claude.json` | Sets `primaryApiKey=sk-dummy-key` and `hasCompletedOnboarding=true` | Removes those keys |
+
+Claude Code reads `ANTHROPIC_BASE_URL` from its env block on startup, so the change takes effect the next time you start a Claude Code session (no restart of the widget needed).
+
+#### Manual switch (without the widget)
+
+To switch to a local LLM manually, add these blocks to `~/.claude/settings.json`:
+
+```json
+{
+  "claudeCode.disableLoginPrompt": true,
+  "env": {
+    "ANTHROPIC_BASE_URL": "http://localhost:8001",
+    "CLAUDE_CODE_ATTRIBUTION_HEADER": "0"
+  }
+}
+```
+
+And in `~/.claude.json`:
+
+```json
+{
+  "primaryApiKey": "sk-dummy-key",
+  "hasCompletedOnboarding": true
+}
+```
+
+To revert to the Anthropic API, remove those keys (or delete the files if they contain nothing else).
 
 ---
 
@@ -263,7 +305,10 @@ Settings live in `.env` in the same directory as the script:
 ```env
 # Full command used to launch llama-server (required for the Launch Server button).
 # Split on whitespace and passed directly to the OS — no shell interpolation.
-LLAMA_SERVER_CMD=C:\path\to\llama-server.exe --model ~/unsloth/Qwen3.5-4B-GGUF/Qwen3.5-4B-UD-Q4_K_XL.gguf --alias "unsloth/Qwen3.5-4B" --temp 0.6 --top-p 0.95 --top-k 20 --min-p 0.00 --port 8001 --kv-unified --cache-type-k q8_0 --cache-type-v q8_0 --flash-attn on --fit on --ctx-size 131072
+LLAMA_SERVER_CMD=C:\path\to\llama-server.exe --model C:\path\to\model.gguf --alias "unsloth/Qwen3.5-4B" --temp 0.6 --top-p 0.95 --top-k 20 --min-p 0.00 --port 8001 --kv-unified --cache-type-k q8_0 --cache-type-v q8_0 --flash-attn on --fit on --ctx-size 131072
+
+# Maximum lines kept in the LLM Backend server log box (oldest removed first). Default: 200.
+LLM_LOG_MAX_LINES=200
 
 # Comma-separated path prefixes (case-insensitive).
 # Only sessions whose working directory starts with one of these are counted.
