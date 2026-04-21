@@ -328,6 +328,11 @@ CONSOLE_REFRESH_MINUTES=30
 # Chrome remote debugging port used by the browser link. Default: 9222.
 # Change this if another process is already using port 9222.
 BROWSER_DEBUG_PORT=9222
+
+# Alternative Chrome path as a last resort. Leave empty to use the default paths.
+# Used in chrome_launcher.py CHROME_PATHS list.
+# Example: C:\Program Files\Google\Chrome Stable\Application\chrome.exe
+CHROME_PATHS_VAR=
 ```
 
 ### Account filtering

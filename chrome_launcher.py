@@ -24,6 +24,7 @@ CHROME_PATHS = [
     r"C:\Program Files\Google\Chrome\Application\chrome.exe",
     r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
     os.path.expandvars(r"%LOCALAPPDATA%\Google\Chrome\Application\chrome.exe"),
+    os.path.expandvars(f"%CHROME_PATHS_VAR%") if os.environ.get("CHROME_PATHS_VAR") else None,
 ]
 
 _SESSION_SENTINEL = "session_ok"
